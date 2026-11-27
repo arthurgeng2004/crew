@@ -2,7 +2,7 @@
 
 和 chat 后端（worker.py 里自己拼 /chat/completions 循环）相比，这里模型拿到的是 Codex 本身那一套：
 shell（exec_command / write_stdin，可交互、后台进程）、apply_patch、view_image、MCP 直连（~/.codex/config.toml
-里配的服务，含图片结果）、网页搜索、skills（~/.codex/skills、项目 AGENTS.md，再加档案 codex_skill_roots）、
+里用户自己配置的服务，含图片结果）、网页搜索、skills（~/.codex/skills、项目 AGENTS.md，再加档案 codex_skill_roots）、
 goals / 计划、上下文自动压缩、Responses 接口的推理项跨回合保留与提示缓存。
 
 crew 自己的工具作为 Codex 的“动态工具”（dynamicTools）挂进去：submit_result、report_problem、ask_lead（工作流里没有），
@@ -20,18 +20,17 @@ import signal
 import subprocess
 import threading
 import time
-import urllib.parse
 
-from . import core
+from . import core, team
 
-DEFAULT_BIN = "codex"     # 档案 codex_bin 可改成自己的包装脚本（比如先设代理再 exec codex）
+DEFAULT_BIN = "codex"
 
 DEV_NOTE = """[crew 工人模式]
-你跑在 Codex 里，Codex 的工具都能用（shell、apply_patch、view_image、~/.codex/config.toml 里配的 MCP 数据服务、skills）。
-另外有 crew 的工具：submit_result（完成时提交，恰好一次）、report_problem（数据源 / 服务故障时报告）、ask_lead（问组长，问完立刻结束本回合等回答）。
+你跑在 Codex 里，Codex 的工具都能用（shell、apply_patch、view_image、用户配置的 MCP 等、skills）。
+另外有 crew 的工具：submit_result（完成时提交，恰好一次）、report_problem（数据源 / 服务故障时报告）、ask_lead（问组长，问完立刻结束本回合等回答）、team_list / team_read / team_post（看队友、读队友的完整成果、给队友留言）。
 - 不要启动子代理；不要等待用户确认——没有人在终端前，只有组长通过 crew 和你交流。
 - MCP 工具结果很大时，用 shell 里的 python 落盘再处理。
-- python3 / pip 用 PATH 里的（crew/workerbin：CREW_PYTHON 或系统 python3）。"""
+- python3 / pip 用 PATH 里的（crew/workerbin，使用安装时选择的解释器）。"""
 
 
 def toml_val(v):
@@ -164,21 +163,16 @@ class CodexRun:
     # ───────── 启动
     def env(self):
         env = {**os.environ, **(self.cfg.get("worker_env") or {})}
+        env.setdefault("CREW_PYTHON", __import__("sys").executable)
         env["PATH"] = self.W.WORKERBIN + os.pathsep + env.get("PATH", "")
         if self.prof.get("env_file"):
             env.update(self.W.load_env_file(self.prof["env_file"]))
-        host = urllib.parse.urlsplit(self.prof.get("base_url") or "").hostname
-        if host and self.prof.get("direct"):
-            for k in ("NO_PROXY", "no_proxy"):
-                cur = env.get(k, "")
-                if host not in cur.split(","):
-                    env[k] = (cur + "," if cur else "") + host
         return env
 
     def overrides(self):
         o = dict(self.prof.get("codex_config") or {})
         if not self.prof.get("codex_subagents"):
-            o["features.multi_agent"] = False        # 子代理会绕过 crew 的并发名额（GPT 网关只给 2 个），默认关
+            o["features.multi_agent"] = False        # 子代理会绕过 crew 的并发名额，默认关
         if self.t.get("cutoff"):
             o["web_search"] = "disabled"             # 回测：实时网页会泄露截止日之后的信息，改用 crew 的 web_fetch（archive.org）
         prov = self.prof.get("codex_provider")
@@ -192,7 +186,7 @@ class CodexRun:
 
     def dyn_tools(self):
         W = self.W
-        names = ["submit_result", "report_problem"] + ([] if self.t.get("wf") else ["ask_lead"]) + (["web_fetch"] if self.t.get("cutoff") else [])
+        names = ["submit_result", "report_problem"] + team.NAMES + ([] if self.t.get("wf") else ["ask_lead"]) + (["web_fetch"] if self.t.get("cutoff") else [])
         spec = {x["name"]: x for x in W.TOOLS + [W.submit_tool(self.t.get("schema"))]}
         out = []
         for n in names:
@@ -226,11 +220,8 @@ class CodexRun:
                 w.ev("error", text=f"加 skills 目录失败：{e}")
         mid, eff, alias = w.model_params()
         self.mid, self.eff = mid, eff
-        common = {"cwd": self.t["cwd"], "model": mid, "approvalPolicy": "never", "sandbox": "danger-full-access",
+        common = {"cwd": self.t["cwd"], **({"model": mid} if mid else {}), "approvalPolicy": "never", "sandbox": "danger-full-access",
                   "developerInstructions": self.developer()}
-        if not mid:
-            common.pop("model")      # 没指定模型：用 Codex 自己的默认（~/.codex/config.toml 或登录账号的默认模型）
-            alias = "Codex 默认模型"
         if self.st.get("thread"):
             try:
                 self.srv.request("thread/resume", {"threadId": self.st["thread"], **common}, stop=self.check_stop)
@@ -239,12 +230,12 @@ class CodexRun:
                 w.ev("error", text=f"接不上原来的 Codex 会话（{e}），开新会话")
         r = self.srv.request("thread/start", {**common, "dynamicTools": self.dyn_tools(), "serviceName": "crew"}, stop=self.check_stop)
         self.save_state(thread=r["thread"]["id"], model=mid)
-        w.update(model_used=f"{alias}·{eff or '默认'}·codex")
-        w.ev("model", text=f"{alias}·{eff or '默认'}（Codex 会话 {r['thread']['id'][:13]}）")
+        w.update(model_used=f"{mid or 'Codex 默认模型'} · {eff or '默认'} · Codex")
+        w.ev("model", text=f"{mid or 'Codex 默认模型'} · {eff or '默认'}（Codex 会话 {r['thread']['id'][:13]}）")
         return True
 
     def handoff(self):
-        """从别的档案（DeepSeek 限流）换过来的任务：交接前一个工人的进展（写过的文件、最近说的话和做的事）。"""
+        """从别的档案换过来的任务（限流改派、档案不存在）：交接前一个工人的进展（写过的文件、最近说的话和做的事）。"""
         sw = self.t.get("switched") or {}
         path = os.path.join(self.w.dir, sw.get("msgs") or "")
         msgs = core.read_json(path) if sw.get("msgs") else None
@@ -316,9 +307,7 @@ class CodexRun:
         return texts
 
     def start_turn(self, texts):
-        p = {"threadId": self.st["thread"], "input": [{"type": "text", "text": "\n\n".join(texts), "text_elements": []}]}
-        if self.mid:
-            p["model"] = self.mid
+        p = {"threadId": self.st["thread"], "input": [{"type": "text", "text": "\n\n".join(texts), "text_elements": []}], **({"model": self.mid} if self.mid else {})}
         if self.eff:
             p["effort"] = self.eff
         r = self.srv.request("turn/start", p, stop=self.check_stop)
@@ -457,7 +446,7 @@ class CodexRun:
             res = {**self.submitted, "round": rnd, "t": core.now(), "turns": self.turns}
             core.write_json(os.path.join(w.dir, "result.json"), res)
             core.write_json(os.path.join(w.dir, f"result.r{rnd}.json"), res)
-            w.ev("submit", round=rnd, summary=self.submitted.get("summary", "")[:1500], files=self.submitted.get("files", []))
+            w.ev("submit", round=rnd, summary=self.submitted.get("summary", ""), files=self.submitted.get("files", []))
             return "review", ""
         if self.asked is not None:
             q, opts = self.asked.get("question", ""), self.asked.get("options") or []
@@ -490,8 +479,6 @@ class CodexRun:
         self.w.ev("tool", name=name, arg=W.preview_args(name, a))
         if name == "submit_result":
             errs = W.validate(a, W.submit_tool(self.t.get("schema"))["parameters"])
-            if not errs and len(str(a.get("summary") or "")) > W.SUMMARY_MAX:
-                errs = [f"summary 有 {len(a['summary'])} 字，太长：压到 600 字以内（结论 + 3–8 条要点），过程和明细写进文件再列进 files"]
             if errs:
                 w.ev("out", name=name, code=1, text="格式不合格", chars=0)
                 return "被拒绝，改好再提交：\n" + "\n".join(errs), False
@@ -504,9 +491,9 @@ class CodexRun:
                 return "（提问已忽略：本回合已提交或已有提问）", False
             self.asked = a
             return "问题已转给组长。现在结束本回合（不要再调用工具），回答会作为新消息发给你。", True
-        if name in ("report_problem", "web_fetch"):
+        if name in ("report_problem", "web_fetch") or name in team.NAMES:
             out, code = w.exec_tool(name, a)
-            w.ev("out", name=name, code=code, text=out[:4000], chars=len(out))
+            w.ev("out", name=name, code=code, text=out[:4000], chars=len(out), full_out=out)
             return out, code == 0
         return f"错误：没有这个工具 {name}", False
 
@@ -546,13 +533,13 @@ class CodexRun:
             code = it.get("exitCode")
             code = 1 if code is None and it.get("status") == "failed" else (code or 0)
             w.check_alerts(out, code)
-            w.ev("out", name="bash", code=code, text=out[:4000], chars=len(out))
+            w.ev("out", name="bash", code=code, text=out[:4000], chars=len(out), full_out=out)
         elif k == "mcpToolCall":
             self.step()
             err = it.get("error")
             out = item_text(it.get("result")) if not err else f"错误：{item_text(err)}"
             w.check_alerts(out, 1 if err else 0)
-            w.ev("out", name="mcp_call", code=1 if err else 0, text=out[:4000], chars=len(out))
+            w.ev("out", name="mcp_call", code=1 if err else 0, text=out[:4000], chars=len(out), full_out=out)
         elif k == "fileChange":
             self.step()
             paths = [c.get("path") for c in it.get("changes") or [] if c.get("path")]

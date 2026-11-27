@@ -1,10 +1,4 @@
-"""工人用的 MCP：配置里的数据服务（mcp_servers）。
-
-连接默认走 crew 自带的 mcp_bridge.py（streamable HTTP、会话握手）；配置 mcp_bridge 可以换成自己的桥脚本。
-这里只做三件事：工具清单（带缓存）、按需给工人看工具说明、调用前按 schema 校验参数——
-参数名写错、少了必填的，直接把正确的签名还给工人，不浪费一次真实调用。
-"""
-import importlib.util
+"""可选 chat 工人的 MCP 工具目录、参数校验与调用。仅连接用户明确配置的服务。"""
 import base64
 import json
 import os
@@ -14,43 +8,17 @@ import time
 
 from . import core
 
-
-def purpose_of(s):
-    """各服务一句话用途（给工人挑服务用；工具名从服务实时取）：配置 mcp_servers.<名字>.purpose"""
-    c = (core.config().get("mcp_servers") or {}).get(s)
-    return str(c.get("purpose") or "") if isinstance(c, dict) else ""
-
-
-_bridge = None
 _cache = {"t": 0, "servers": {}, "errors": {}}
 _lock = threading.Lock()
 
 
 def bridge(cfg):
-    global _bridge
-    if _bridge is None:
-        path = cfg.get("mcp_bridge") or ""
-        if not path:
-            from . import mcp_bridge as m
-            if not m.server_urls():
-                raise RuntimeError("没有配置 MCP 服务（mcp_servers）")
-            _bridge = m
-            return m
-        spec = importlib.util.spec_from_file_location("crew_mcp_bridge", os.path.expanduser(path))
-        if not spec:
-            raise RuntimeError(f"找不到 MCP 桥脚本：{path}（配置 mcp_bridge）")
-        m = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(m)
-        _bridge = m
-    return _bridge
+    from . import mcp_bridge
+    return mcp_bridge
 
 
 def available(cfg):
-    try:
-        bridge(cfg)
-        return True
-    except Exception:  # noqa: BLE001
-        return False
+    return bool(bridge(cfg).servers(cfg))
 
 
 def catalog(cfg, max_age=600):
@@ -62,12 +30,13 @@ def catalog(cfg, max_age=600):
         servers, errors = {}, {}
 
         def one(s):
-            j, err = b._rpc(s, "tools/list", {}, 30)
-            if err or not isinstance(j, dict):
-                errors[s] = err or "没有返回"
+            j, err = b._rpc(s, "tools/list", {}, 30, cfg)
+            if err or not isinstance(j, dict) or j.get("error"):
+                errors[s] = err or (json.dumps(j.get("error"), ensure_ascii=False)
+                                    if isinstance(j, dict) else "没有返回 JSON-RPC 对象")
             else:
                 servers[s] = (j.get("result") or {}).get("tools") or []
-        ths = [threading.Thread(target=one, args=(s,), daemon=True) for s in sorted(b.server_urls())]
+        ths = [threading.Thread(target=one, args=(s,), daemon=True) for s in sorted(b.server_urls(cfg))]
         for t in ths:
             t.start()
         for t in ths:
@@ -82,12 +51,13 @@ def brief(cfg):
         servers, errors = catalog(cfg)
     except Exception as e:  # noqa: BLE001
         return f"（MCP 服务目录取不到：{e}）"
+    b = bridge(cfg)
     lines = []
     for s in sorted(set(servers) | set(errors)):
         if s in errors:
             lines.append(f"- {s}：现在连不上（{core.clip(errors[s], 80)}）")
         else:
-            lines.append(f"- {s}：{purpose_of(s)}｜工具：{', '.join(t['name'] for t in servers[s])}")
+            lines.append(f"- {s}：{b.description(s, cfg)}｜工具：{', '.join(t['name'] for t in servers[s])}")
     return "\n".join(lines)
 
 
@@ -123,7 +93,7 @@ def describe(cfg, server=None, tool=None):
         if not t:
             return f"错误：{server} 没有工具 {tool}；有：{', '.join(x['name'] for x in ts)}"
         return f"{server}.{tool}\n{t.get('description') or ''}\n参数：\n{signature(t, full=True)}"
-    parts = [f"{server}：{purpose_of(server)}"]
+    parts = [f"{server}：{PURPOSE.get(server, '')}"]
     for t in ts:
         d = " ".join(str(t.get("description") or "").split())
         parts.append(f"\n● {t['name']} — {core.clip(d, 400)}\n{signature(t)}")
@@ -152,26 +122,25 @@ def check_args(cfg, server, tool, args):
 
 def call(cfg, server, tool, args, timeout=180, img_dir=None):
     """返回 (结果, 错误, 图片路径列表)。结果是解析好的 JSON 或原文。
-    结果里的图片块（文档服务带的图表等）存成文件放进 img_dir，原位换成「[图 k：路径]」，
+    结果里的图片块存成文件放进 img_dir，原位换成「[图 k：路径]」，
     工人用 view_image 看；不再把 base64 当文字塞进结果。"""
     b = bridge(cfg)
     if not img_dir or not hasattr(b, "_rpc"):
-        d, err = b.call(server, tool, args or {}, timeout)
+        d, err = b.call(server, tool, args or {}, timeout, cfg)
         return d, err, []
-    j, err = b._rpc(server, "tools/call", {"name": tool, "arguments": args or {}}, timeout, None)
+    j, err = b._rpc(server, "tools/call", {"name": tool, "arguments": args or {}}, timeout, cfg)
     if err:
         return None, err, []
     if not isinstance(j, dict) or j.get("error"):
-        return None, json.dumps((j or {}).get("error"), ensure_ascii=False)[:300], []
+        return None, (json.dumps(j.get("error"), ensure_ascii=False)[:300]
+                      if isinstance(j, dict) else "没有返回 JSON-RPC 对象"), []
     res = j.get("result") or {}
     parts, imgs = [], []
     for blk in res.get("content") or []:
         if isinstance(blk, dict) and blk.get("type") == "image" and blk.get("data"):
             os.makedirs(img_dir, exist_ok=True)
             ext = {"image/png": "png", "image/gif": "gif", "image/webp": "webp"}.get(blk.get("mimeType") or "", "jpg")
-            # 服务翻页取图时每张图前有「[图 N] 前文」：文件按全文图号命名，和服务端对得上
-            m = re.match(r"\[图 (\d+)\]", parts[-1] or "") if parts else None
-            k = int(m.group(1)) if m else len(imgs) + 1
+            k = len(imgs) + 1
             p = os.path.join(img_dir, f"img_{k:03d}.{ext}")
             with open(p, "wb") as f:
                 f.write(base64.b64decode(blk["data"]))

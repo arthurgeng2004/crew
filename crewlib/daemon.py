@@ -21,7 +21,6 @@ class Daemon:
         self.workers = {}        # id -> Worker
         self.unpause = set()     # 正在暂停收尾时又被叫“继续”的任务：收尾后直接排队
         self.rl = {}             # 档案 -> {"bad": 最近一次 429, "ok": 最近一次成功}：限流时排队任务改派 fallback_profile
-        self.offhours = set()    # 到了档案可用时段外被暂停的任务：收尾后排队，等时段开始自动续跑
         self.probe_next = {}     # 巡检名 -> 下次跑的时间
         self.probing = set()     # 正在跑的巡检（各在自己的线程里，不卡主循环）
         self.lock = threading.RLock()
@@ -79,11 +78,6 @@ class Daemon:
                     self.set_status(tid, "queued", note or "限流，换档案续做")
                     return
                 status = "failed"
-            if status == "paused" and tid in self.offhours:
-                self.offhours.discard(tid)
-                self.unpause.discard(tid)
-                self.set_status(tid, "queued", note or "时段外，下个时段续跑")
-                return
             if status == "paused" and (self.stop or tid in self.unpause):
                 # 服务停止时被打断的，或暂停途中又被叫继续的：排队接着跑
                 self.unpause.discard(tid)
@@ -97,7 +91,7 @@ class Daemon:
                 self.set_status(tid, status, note)
             self.log(f"{tid} → {(self.tasks.get(tid) or {}).get('status', status)} {note[:200]}")
 
-    # ───────── 限流改派：档案 fallback_profile（比如默认工人被限流就改派 GPT）
+    # ───────── 限流改派：档案写了 fallback_profile 才改派（默认不写）
     def note_rate(self, prof, ok):
         r = self.rl.setdefault(prof, {"bad": 0, "ok": 0})
         r["ok" if ok else "bad"] = core.now()
@@ -109,7 +103,7 @@ class Daemon:
     def switch_profile(self, tid, why):
         """把任务换到档案的 fallback_profile：chat 对话记录改名留作交接（新档案开新 Codex 会话），排队续做。"""
         t = self.tasks.get(tid) or {}
-        old = t.get("profile") or self.cfg.get("default_profile") or "ds"
+        old = t.get("profile") or self.cfg.get("default_profile") or "gpt"
         fb = (self.cfg["profiles"].get(old) or {}).get("fallback_profile")
         if not fb or fb not in self.cfg["profiles"]:
             return False
@@ -123,6 +117,21 @@ class Daemon:
         core.append_event(tid, "model", text=f"{why}：改用 {fb}" + ("（交接已做的部分）" if sw.get("msgs") else ""))
         self.log(f"{tid} {why}，改用 {fb}")
         return True
+
+    def retire_profile(self, tid):
+        """任务的档案已不存在：改到 default_profile，chat 对话记录改名交接。"""
+        t = self.tasks.get(tid) or {}
+        old = t.get("profile")
+        new = core.profile_name(old, self.cfg)
+        d = core.task_dir(tid)
+        sw = {"from": old, "to": new, "t": core.now(), "why": f"{old} 档案不存在"}
+        src = os.path.join(d, "msgs.json")
+        if os.path.exists(src):
+            sw["msgs"] = f"msgs.{old}.json"
+            os.replace(src, os.path.join(d, sw["msgs"]))
+        self.update_task(tid, profile=new, model=None, switched=sw)
+        core.append_event(tid, "model", text=f"{old} 档案不存在：改用 {new}" + ("（交接已做的部分）" if sw.get("msgs") else ""))
+        self.log(f"{tid} {old} 档案不存在，改用 {new}")
 
     # ───────── 投递箱
     def handle_inbox(self, tid):
@@ -237,7 +246,7 @@ class Daemon:
                 load[group(self.tasks[tid])] = load.get(group(self.tasks[tid]), 0) + 1
         # 按档案限并发（档案的 max_parallel，如 GPT 网关只给 2 个名额）：满了的档案，它的任务留在排队里
         # 档案可写 parallel_group：同组的档案共用名额（gpt 与 gpt-chat 都打同一个网关）
-        pname = lambda x: x.get("profile") or self.cfg.get("default_profile") or "ds"
+        pname = lambda x: core.profile_name(x.get("profile"), self.cfg)
         pdef = lambda x: self.cfg["profiles"].get(pname(x)) or {}
         prof_of = lambda x: pdef(x).get("parallel_group") or pname(x)
         pcap_of = lambda x: int(pdef(x).get("max_parallel") or 0) or float("inf")
@@ -245,24 +254,25 @@ class Daemon:
         for tid, w in self.workers.items():
             if w.is_alive() and tid in self.tasks:
                 busy[prof_of(self.tasks[tid])] = busy.get(prof_of(self.tasks[tid]), 0) + 1
-        # 档案的可用时段（hours，UTC）：时段外运行中的到点暂停（下个时段自动续跑），排队的不开工
-        for tid, w in list(self.workers.items()):
-            t = self.tasks.get(tid) or {}
-            if w.is_alive() and not w.want and not t.get("anytime") and not core.in_hours(pdef(t)):
-                self.offhours.add(tid)
-                w.interrupt("paused", f"{pname(t)} 可用时段（UTC {pdef(t).get('hours')}）结束")
-                self.log(f"{tid} 到了 {pname(t)} 时段外，暂停，下个时段续跑")
         queued = [t for tid, t in self.tasks.items() if t.get("status") == "queued" and tid not in self.workers]
+        # 档案已不存在的排队任务：换到 default_profile，开过工的 chat 记录改名留作交接，和限流改派同一套
         for x in queued:
-            if not x.get("anytime") and not core.in_hours(pdef(x)):
-                why = f"等 {pname(x)} 可用时段（UTC {pdef(x).get('hours')}）"
-                if x.get("note") != why:
-                    self.update_task(x["id"], note=why, activity=why)
-        queued = [x for x in queued if x.get("anytime") or core.in_hours(pdef(x))]
+            if x.get("profile") and x["profile"] not in self.cfg["profiles"] and core.profile_name(x["profile"], self.cfg) in self.cfg["profiles"]:
+                self.retire_profile(x["id"])
         # 档案正被限流、又有 fallback_profile 的：还没开工的排队任务直接改派（开过工的有对话记录，同样交接）
         for x in queued:
             if pdef(x).get("fallback_profile") and x.get("fallback") is not False and self.limited(pname(x)):
                 self.switch_profile(x["id"], f"{pname(x)} 正被限流")
+        # Claude 档案：周额度用到 quota_stop 就不开新任务（排队等重置），排队的任务上写明原因
+        from .clauderun import quota_held
+        held = {}
+        for x in queued:
+            why = quota_held(pdef(x)) if pdef(x).get("backend") == "claude" else ""
+            if why:
+                held[x["id"]] = why
+                if x.get("note") != why:
+                    self.update_task(x["id"], note=why)
+        queued = [x for x in queued if x["id"] not in held]
         while running < cap and queued:
             ok = [x for x in queued if busy.get(prof_of(x), 0) < pcap_of(x)]
             if not ok:

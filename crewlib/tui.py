@@ -1,4 +1,4 @@
-"""crew 面板（curses，SSH 里可用）。四页：1 主页、2 工作流、3 任务、4 帮助；页内 ↑↓←→ 移动，Enter 整页打开选中项，Esc 返回。
+"""crew 面板（curses，SSH 里可用）。四页：1 主页、2 任务、3 工作流、4 帮助；页内 ↑↓←→ 移动，Enter 整页打开选中项，Esc 返回。
 
 主页：↑↓ 选、Enter 进入（工作流 → 进度树；对话 → 只看那个对话的任务；等人处理的任务 → 直接打开）
 工作流页：↑↓ 选工作流，Tab 切到代理列表（↑↓ 选代理，Enter 打开它的对话 / 时间线），v 显示每个代理最近几步，
@@ -19,7 +19,8 @@ import time
 from . import cli, core, wf
 
 KEYS = """面板按键
-  1 主页   2 工作流   3 任务   4 帮助   Esc 返回上一层   q 退出   U 启动后台
+  1 主页   2 任务   3 工作流   4 帮助   Esc 返回上一层   q 退出   U 启动后台
+  鼠标滚轮不操作面板；按住 Shift（Mac 终端通常用 Option）拖选复制。
   在 1 / 2 / 3 页里：↑↓←→ 在本页移动；选中一项按 Enter，整页打开它（只有这一项的全部内容），Esc 回来
 主页
   ↑↓ 选择   ←→ 跳到上一块 / 下一块（工作流 · 对话 · 等处理的任务）
@@ -94,7 +95,7 @@ class App:
             ts = [t for t in ts if t["status"] in core.NEEDS_LEAD]
         # 需要处理的排前面，其次运行中，最后已结束
         order = {"waiting": 0, "review": 1, "failed": 2, "running": 3, "paused": 4, "queued": 5}
-        ts.sort(key=lambda t: (order.get(t["status"], 9), -(t.get("needs_since") or t.get("created", 0)) if t["status"] in core.NEEDS_LEAD else t.get("created", 0)))
+        ts.sort(key=lambda t: (order.get(t["status"], 9), -(t.get("needs_since") or t.get("created", 0)) if t["status"] in core.NEEDS_LEAD else -(t.get("finished") or t.get("updated") or 0) if t["status"] in core.FINAL else t.get("created", 0)))
         cur = self.current()
         self.tasks = ts
         if cur:
@@ -128,11 +129,11 @@ class App:
         return curses.color_pair(n) if n else 0
 
     def tabs(self, y, w):
-        """页签行：1 主页 2 工作流 3 任务。"""
+        """页签行：1 主页 2 任务 3 工作流。"""
         run_w = sum(1 for x in self.wfs if x["status"] not in wf.DONE)
         live = sum(1 for t in self.all_tasks if t["status"] not in core.FINAL)
         x = 1
-        for key, name, label in (("1", "home", "主页"), ("2", "wf", f"工作流 {run_w}"), ("3", "tasks", f"任务 {live}"), ("4", "help", "帮助")):
+        for key, name, label in (("1", "home", "主页"), ("2", "tasks", f"任务 {live}"), ("3", "wf", f"工作流 {run_w}"), ("4", "help", "帮助")):
             s = f" {key} {label} "
             self.put(y, x, s, curses.A_REVERSE | curses.A_BOLD if ({"conv": "tasks", "wfd": "wf"}.get(self.page, self.page)) == name else curses.A_DIM)
             x += core.swidth(s) + 2
@@ -172,7 +173,7 @@ class App:
         for i, line in enumerate(lines[self.hscroll:self.hscroll + h - 4]):
             bold = line and not line.startswith(" ")
             self.put(3 + i, 1, line, curses.A_BOLD | curses.color_pair(4) if bold else 0)
-        self.footer(h, w, " ↑↓ 翻  Esc 返回  1 主页  2 工作流  3 任务  q 退出 ")
+        self.footer(h, w, " ↑↓ 翻  Esc 返回  1 主页  2 任务  3 工作流  q 退出 ")
         self.scr.refresh()
 
     def draw_home(self):
@@ -242,7 +243,7 @@ class App:
         if items:
             iy = items[self.hsel][2]
             self.put(iy, 1, "▸", curses.A_BOLD | curses.color_pair(3))
-        self.footer(h, w, " ↑↓ 选择  ←→ 换一块  Enter 打开  1 主页 2 工作流 3 任务 4 帮助  q 退出 ")
+        self.footer(h, w, " ↑↓ 选择  ←→ 换一块  Enter 打开  1 主页 2 任务 3 工作流 4 帮助  q 退出 ")
         self.scr.refresh()
 
     def draw_wf(self):
@@ -253,7 +254,7 @@ class App:
         y = 3
         if not self.wfs:
             self.put(y, 2, "没有工作流（24 小时内）。Claude 用 mcp__crew__workflow 交给 crew，或终端 crew wf run 脚本.js", curses.A_DIM)
-            self.footer(h, w, " 1 主页  3 任务  4 帮助  q 退出 ")
+            self.footer(h, w, " 1 主页  2 任务  4 帮助  q 退出 ")
             self.scr.refresh()
             return
         for i, x in enumerate(self.wfs[:5] if self.wsel < 5 else self.wfs[self.wsel - 4:self.wsel + 1]):
@@ -488,7 +489,7 @@ class App:
                 except curses.error:
                     pass
                 self.scr.refresh()
-                ch = self.scr.get_wch()
+                ch = self.read_key(-1)
                 if ch in ("\n", "\r", curses.KEY_ENTER):
                     return text.strip()
                 if ch == "\x1b":
@@ -511,7 +512,7 @@ class App:
         self.scr.timeout(-1)
         try:
             while True:
-                ch = self.scr.get_wch()
+                ch = self.read_key(-1)
                 if ch == "\x1b":
                     return None
                 if isinstance(ch, str) and ch.isdigit() and 1 <= int(ch) <= len(options):
@@ -543,8 +544,8 @@ class App:
             if ch not in ("1", "2", "3"):
                 return True
         if ch in ("1", "2", "3"):
-            self.page = {"1": "home", "2": "wf", "3": "tasks"}[ch]
-            if ch == "3":
+            self.page = {"1": "home", "2": "tasks", "3": "wf"}[ch]
+            if ch == "2":
                 self.conv = self.jump = ""
             self.wscroll = 0
             return True
@@ -798,7 +799,7 @@ class App:
               ("时间", " · ".join(x for x in (f"派发 {utc(t.get('created'))}" if t.get("created") else "", f"开始 {utc(t.get('started'))}" if t.get("started") else "",
                                                f"结束 {utc(t.get('finished'))}" if t.get("finished") else "", f"最近更新 {utc(t.get('updated'))}" if t.get("updated") else "") if x)),
               ("派发方", f"{core.origin_label(t)} · owner {t.get('owner') or '-'}" + (f" · 批次 {t['batch']}" if t.get("batch") else "") + (f" · 分组 {t['group']}" if t.get("group") else "")),
-              ("模型", t.get("model_used") or t.get("profile") or "-"), ("目录", t.get("cwd") or "-")]
+              ("模型", core.model_label(t, core.config()) or t.get("profile") or "-"), ("目录", t.get("cwd") or "-")]
         if t.get("activity") and t.get("status") == "running":
             kv.append(("当前", t["activity"]))
         for k_, v_ in kv:
@@ -1063,13 +1064,23 @@ class App:
             return None
         return True
 
-    def escape(self):
-        """方向键没被 curses 认出来时（终端描述库缺失，或 SSH 延迟让 ESC 和后面的 [A 分两次到）会以原始序列到达：
-        自己解析。第一个字符多等一会儿（200ms，网络慢也等得到），之后每个 60ms；只有真的没有后续才算 Esc 键，
-        认不出的序列丢掉，不会被当成 Esc 把你踢回主页。"""
+    def read_key(self, delay=500):
+        ch = self.scr.get_wch()
+        if ch == curses.KEY_MOUSE:
+            try:
+                curses.getmouse()
+            except curses.error:
+                pass
+            return ""
+        return self.escape(delay) if ch == "\x1b" else ch
+
+    def escape(self, delay=500):
+        """解析完整 CSI / SS3 序列；SGR 和旧 X10 鼠标事件整条丢弃。
+        不限制为 6 字符，避免鼠标坐标残留成为数字跳页键。
+        """
         seq = ""
         try:
-            while len(seq) < 6:
+            while True:
                 self.scr.timeout(200 if not seq else 60)
                 try:
                     c = self.scr.get_wch()
@@ -1078,10 +1089,20 @@ class App:
                 if not isinstance(c, str):
                     break
                 seq += c
-                if seq[-1].isalpha() or seq[-1] == "~":
+                if seq == "[M":
+                    # X10: ESC [ M 后面恰有三个位置/按钮字符。
+                    for _ in range(3):
+                        try:
+                            self.scr.getch()
+                        except curses.error:
+                            break
+                    return ""
+                if len(seq) >= 2 and "@" <= c <= "~":
+                    break
+                if len(seq) == 1 and c not in ("[", "O"):
                     break
         finally:
-            self.scr.timeout(500)
+            self.scr.timeout(delay)
         keys = {"[A": curses.KEY_UP, "OA": curses.KEY_UP, "[B": curses.KEY_DOWN, "OB": curses.KEY_DOWN, "[C": curses.KEY_RIGHT,
                 "OC": curses.KEY_RIGHT, "[D": curses.KEY_LEFT, "OD": curses.KEY_LEFT, "[5~": curses.KEY_PPAGE, "[6~": curses.KEY_NPAGE,
                 "[F": curses.KEY_END, "OF": curses.KEY_END, "[4~": curses.KEY_END, "[H": curses.KEY_HOME}
@@ -1092,15 +1113,13 @@ class App:
             self.load()
             self.draw()
             try:
-                ch = self.scr.get_wch()
+                ch = self.read_key()
             except curses.error:
                 continue
             except KeyboardInterrupt:
                 return
             if ch == curses.KEY_RESIZE:
                 continue
-            if ch == "\x1b":
-                ch = self.escape()
             if not self.act(ch):
                 return
             self.load(force=True)
@@ -1179,6 +1198,9 @@ def run(scr):
     scr.keypad(True)
     if hasattr(curses, "set_escdelay"):
         curses.set_escdelay(200)
+    # 把滚轮作为鼠标事件接收，防止备用屏幕把它翻译成方向键。
+    curses.mousemask(curses.ALL_MOUSE_EVENTS)
+    os.write(1, b"\x1b[?1007l\x1b[?1000h\x1b[?1006h")
     App(scr).loop()
 
 
@@ -1221,4 +1243,13 @@ def main(a=None):
                         break
                     except curses.error:
                         continue
-    curses.wrapper(run)
+    try:
+        curses.wrapper(run)
+    finally:
+        # wrapper / 初始化异常、Ctrl-C 和正常退出均恢复终端。
+        try:
+            curses.mousemask(0)
+        except curses.error:
+            pass
+        finally:
+            os.write(1, b"\x1b[?1000l\x1b[?1006l")

@@ -1,4 +1,4 @@
-// crew 工作流运行器：跑 Claude 写的工作流脚本，脚本里的每个 agent() 变成一个 DeepSeek 工人任务。
+// crew 工作流运行器：跑 Claude 写的工作流脚本，脚本里的每个 agent() 变成一个工人任务（默认 GPT，跑在 Codex 里）。
 //
 // 脚本写法和 Claude Code 的 Workflow 一样：
 //   export const meta = { name, description, phases: [{ title, detail }] }
@@ -25,7 +25,6 @@ const HERE = path.dirname(fileURLToPath(import.meta.url))
 const CREW_BIN = path.join(path.dirname(HERE), 'bin', 'crew')
 const HOME = path.resolve(process.env.CREW_HOME || path.join(os.homedir(), '.crew'))
 const TASKS = path.join(HOME, 'tasks')
-const PY = process.env.CREW_PY || 'python3'
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
 const FINAL_OK = ['accepted', 'review']
 const FINAL_BAD = ['cancelled', 'rejected']
@@ -197,7 +196,7 @@ function flushBatch() {
   batchTimer = null
   flushing = (async () => {
     try {
-      const out = await sh([PY, CREW_BIN, '--json', 'run', '--stdin', '--owner', RUN.owner || 'workflow'], JSON.stringify({ tasks: items.map(i => i.spec) }))
+      const out = await sh([CREW_BIN, '--json', 'run', '--stdin', '--owner', RUN.owner || 'workflow'], JSON.stringify({ tasks: items.map(i => i.spec) }))
       const made = JSON.parse(out)
       if (cancelling) made.forEach(m => drop(m.id, 'cancel'))
       items.forEach((it, k) => it.resolve(made[k]))
@@ -244,7 +243,7 @@ function pollTasks() {
     // 续上下文的一步只算这一步自己的回合和 token（任务上的是累计数）
     a.turns = Math.max(0, (t.turns || 0) - (a.base?.turns || 0))
     a.tokens = Math.max(0, usageOf(t) - (a.base?.tokens || 0))
-    if (t.model_used) a.model = t.model_used
+    if (t.model_used) a.model = String(t.model_used)
     if (t.started && !a.t_start) a.t_start = t.started
     if (FINAL_OK.includes(t.status) && (t.round || 1) < (a.wantRound || 1) && !inboxBusy(tid) && now() - (a.dropAt || 0) > 15) {
       // 下一步的指示没被接住（比如投递时任务还没收尾）：重投
@@ -385,14 +384,11 @@ function log(msg) {
 }
 
 // 模型与思考档位：opts.model / opts.effort（同 Claude Code Workflow），meta.phases[].model / effort，运行时的 model / effort，逐级兜底。
-// DeepSeek 账号上只有 flash 一个模型，默认思考档位 max；agent 的 effort（low / high / max）照传、按任务生效。
-// Claude 的模型名（haiku / sonnet / opus / fable）照收不报错、按默认模型跑。
-// GPT：profile 写 gpt，或 model 写 gpt-* 这类模型名，都走 gpt 档案。
-const PROFILES = ['ds', 'ds-fast', 'gpt', 'mock']
+// model 原样传递；profile 单独选择后端，省略 model 时使用 CLI 默认模型。
+const PROFILES = ['gpt', 'gpt-chat', 'claude', 'mock']
 const isOpenAI = m => /^(gpt|o\d)/i.test(String(m || ''))
-function mapModel(m) {
-  if (!m || PROFILES.includes(m)) return [null, null]
-  return /haiku|sonnet|opus|fable|claude/i.test(String(m)) ? [null, null] : [String(m), null]
+function mapModel(m, profile) {
+  return [m ? String(m) : null, null]
 }
 function phaseMeta(title) {
   return state.phases.find(p => p.title === title) || {}
@@ -420,9 +416,10 @@ function makeHooks(ctx) {
     const label = String(opts.label || prompt.trim().split('\n')[0]).slice(0, 60)
     const sname = opts.continueTask ? `task:${opts.continueTask}` : opts.session ? String(opts.session) : ''
     const ph = phaseMeta(phase)
-    const [mOpt, eOpt] = mapModel(opts.model)
-    const [mPh, ePh] = mapModel(ph.model)
-    const [mRun, eRun] = mapModel(RUN.model)
+    const wantProf = opts.profile || RUN.profile || null
+    const [mOpt, eOpt] = mapModel(opts.model, wantProf)
+    const [mPh, ePh] = mapModel(ph.model, wantProf)
+    const [mRun, eRun] = mapModel(RUN.model, wantProf)
     const model = mOpt || mPh || mRun || null
     const effort = opts.effort || eOpt || ph.effort || ePh || RUN.effort || eRun || null
     const sig = JSON.stringify([prompt, opts.schema ?? null, opts.cwd ?? null, opts.files ?? null, opts.accept ?? null, sname, model, effort])
@@ -430,7 +427,7 @@ function makeHooks(ctx) {
     const occ = (seen.get(h) || 0) + 1
     seen.set(h, occ)
     const key = `${h}#${occ}`
-    const profile = opts.profile || (PROFILES.includes(opts.model) ? opts.model : null) || (isOpenAI(opts.model) ? 'gpt' : null) || RUN.profile || undefined
+    const profile = opts.profile || (PROFILES.includes(opts.model) && opts.model !== 'claude' ? opts.model : null) || (isOpenAI(opts.model) ? 'gpt' : null) || RUN.profile || undefined
     if (opts.isolation && !warnedIsolation) {
       warnedIsolation = true
       log('crew 不支持 isolation: worktree，按普通目录跑；并行写同一文件的任务请分开目录')
@@ -619,7 +616,7 @@ async function main() {
     const beat = readJson(path.join(HOME, 'daemon.json'), null)?.beat || 0
     if (now() - beat < 60 || fs.existsSync(path.join(HOME, 'stopped'))) return
     log('后台服务的心跳停了，拉起它')
-    spawn(PY, [CREW_BIN, 'up', '--watch'], { detached: true, stdio: 'ignore', env: { ...process.env } }).unref()
+    spawn(CREW_BIN, [ 'up', '--watch'], { detached: true, stdio: 'ignore', env: { ...process.env } }).unref()
   }
   const ctx = { prefix: '', depth: 0, phase: '' }
   const h = makeHooks(ctx)

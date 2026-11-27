@@ -1,4 +1,4 @@
-"""工人：一个任务一个线程，跑 OpenAI 兼容接口（DeepSeek 等）的工具循环。
+"""工人：一个任务一个线程，跑 OpenAI 兼容接口的工具循环（gpt-chat 档案；gpt 档案走 codexrun）。
 
 工人在这些时候退出线程、把状态交回后台服务：提交成果（→ 待验收）、向组长提问（→ 提问）、
 暂停、取消、失败。不设回合上限、不设 token 预算、命令不设超时：工人一直干到自己提交；用量只统计。
@@ -14,27 +14,29 @@ import random
 import re
 import signal
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
-from . import core, mcp
+from . import core, mcp, team
 
 WORKERBIN = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "workerbin")
 
-SYSTEM = """你是一个研究工作流里的执行者（工人），组长是 Claude。组长把任务派给你，你做完提交，组长会逐条抽查验收，不合格会退回让你改。
+SYSTEM = """你是工作流里的执行者（工人），组长是 Claude。组长把任务派给你，你做完提交，组长会逐条抽查验收，不合格会退回让你改。
 
 工作纪律：
 1. 只做任务里写的事。拿不准任务口径、且不同理解会让结果明显不同时，调用 ask_lead 提问，然后等回答；小事自己按最合理的理解做，并在提交时写明你的理解。
 2. 不编造。每个数字、每句引语都要能指到来源（文件路径 + 位置，或网址）。找不到就写"未找到"，并写明查过哪里。
 3. 成果写进文件（任务指定的位置；没指定就写在工作目录下），提交时列出文件路径。大文件分段读，或用小脚本提取需要的字段，不要整份打印。
 4. 用脚本核对自己的数（加总、口径、单位），把核对结果写进 self_check。
-5. 完成后调用 submit_result 恰好一次。summary 要凝练（600 字以内，结论先行，3–8 条要点），组长只读它和你列的文件；过程、明细放进文件。open_issues 每条一句话，写未解决的问题和你做的假设。
+5. 完成后调用 submit_result 恰好一次。summary 是给组长的汇报，不限字数，但要自己提纯：只写组长做判断用得上的信息——结论、每个关键数字和它的出处、怎么得出的（口径、推算、取舍理由）、和预期或别的来源不一致的地方、你的判断和把握程度。有用的信息写全，不要为了简短删掉；没用的一句不写：不复述任务、不写工作流水账（先查了什么再查了什么）、不写客套和空话、不重复文件里的大段原文，查过但没结果的路只在影响结论时一句带过。open_issues 写未解决的问题和你做的假设，写清楚为什么、影响什么。
 6. 收到组长的退回意见时，逐条改，改完重新 submit_result，并在 summary 里逐条说明怎么改的。
 7. 工具、数据源、MCP、接口出故障（5xx、连不上、超时、鉴权或额度错误、脚本说服务不可用、结果里带 error 字段）——这不是“没有数据”。立刻调用 report_problem 报告（写明哪个源、原样的错误信息、影响哪部分），组长会马上知道；不要把空结果当成查无此项，不要悄悄换别的来源顶替还当没事。修故障不是你的事：最多重试一次，不要反复重试或等待，不要去查服务器、服务配置，不要翻别的项目找替代材料（除非任务本来就让你用它们）。任务里不依赖这个源的部分照常做；依赖它的写进 open_issues 并标明“因 X 故障未做 / 未核实”，然后提交。
-8. 够了就交。验收标准满足了就提交，不要扩大范围：任务没要的数不取，没要求交叉核对就不去翻原件逐个核对（数据服务返回的数本身就是来源，标明服务.工具即可），一个口径上的小疑问写进 open_issues，不要为它再跑十几回合。组长要更多会退回让你补。"""
+8. 够了就交。验收标准满足了就提交，不要扩大范围：任务没要的数不取，没要求交叉核对就不去翻原件逐个核对（数据服务返回的数本身就是来源，标明服务.工具即可），一个口径上的小疑问写进 open_issues，不要为它再跑十几回合。组长要更多会退回让你补。
+9. 和队友合作：同一个对话派的其他任务是你的队友。开工前先 team_list 看看谁在做什么、谁已经交了什么，用得上的用 team_read 读完整成果、直接读他们列的文件（不要改别人的文件），别重复别人做过的事；引用时写明出自哪个任务。你查到对队友有用的东西（发现、可复用的中间结果、某数据源坏了、某口径有陷阱），用 team_post 发到队伍公告板。"""
 
 TOOLS = [
     {"name": "bash", "description": "在工作目录里执行一条 bash 命令，返回退出码和输出（过长的输出会存盘，只给开头结尾和全文路径）。默认 10 分钟超时，到点停掉并报错；确实要跑更久（大批量下载、长脚本）就传 timeout_s（秒）。别跑 find / 这类扫全盘的命令。",
@@ -53,17 +55,18 @@ TOOLS = [
                                                     "key": {"type": "string", "description": "要关的告警 key（报告时回执里给的，如 报告:1a2b3c4d）"}}, "required": ["problem"]}},
     {"name": "mcp_tools", "description": "查本机 MCP 数据服务：不带参数 = 服务目录；带 server = 这个服务的全部工具和参数；再带 tool = 这个工具的完整说明。调用前不确定参数就先查。",
      "parameters": {"type": "object", "properties": {"server": {"type": "string"}, "tool": {"type": "string"}}}},
-    {"name": "mcp_call", "description": "调用一个 MCP 数据工具。args 按 mcp_tools 给的参数写成 JSON 对象。结果太长时全文存盘、只给开头和路径；要留原件或后续用脚本处理就传 save_to（文件路径），全文写进去。出错会原样返回：服务故障（5xx、连不上、超时）不是“没有数据”。",
+    {"name": "mcp_call", "description": "调用一个 MCP 数据工具（由用户配置）。args 按 mcp_tools 给的参数写成 JSON 对象。结果太长时全文存盘、只给开头和路径；要留原件或后续用脚本处理就传 save_to（文件路径），全文写进去。出错会原样返回：服务故障（5xx、连不上、超时）不是“没有数据”。",
      "parameters": {"type": "object", "properties": {"server": {"type": "string"}, "tool": {"type": "string"}, "args": {"type": "object"},
                                                     "save_to": {"type": "string", "description": "可选：完整结果写到这个文件（JSON 结果存成缩进 JSON，文本原样）"}},
                     "required": ["server", "tool"]}},
-    {"name": "view_image", "description": "看一张图：图片文件（png / jpg / webp / gif），或 PDF 的某一页（page，从 1 开始）。图会附在下一条消息里给你看，看完把读到的数、文字写进文件——图之后会移出上下文。文档里的图表、扫描的表格、PDF 里转不出文字的页都用它。一回合最多看 4 张。",
+    {"name": "view_image", "description": "看一张图：图片文件（png / jpg / webp / gif），或 PDF 的某一页（page，从 1 开始）。图会附在下一条消息里给你看，看完把读到的数、文字写进文件——图之后会移出上下文。PDF 里的图表、扫描的表格、PDF 里转不出文字的页都用它。一回合最多看 8 张。",
      "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "page": {"type": "number", "description": "PDF 的页码（从 1 开始）；图片不用写"}}, "required": ["path"]}},
     {"name": "web_fetch", "description": "抓一个网页或文件（官网产品页、规格书、价格页、PDF）。全文存进 save_to（不写就存在工作目录的 _web/ 下），旁边一个 .meta.json 记网址、抓取时间、来源；返回网页正文（文字）。任务有截止日（回测）时只能拿 archive.org 上截止日之前的存档，拿不到就写进 open_issues，不要用现在的网页顶替。",
      "parameters": {"type": "object", "properties": {"url": {"type": "string"}, "save_to": {"type": "string", "description": "可选：存到这个路径（建议存进项目的原件目录）"}}, "required": ["url"]}},
     {"name": "ask_lead", "description": "向组长（Claude）提一个问题，然后暂停等回答。只在口径不清、且不同理解会明显改变结果时用。",
      "parameters": {"type": "object", "properties": {"question": {"type": "string"}, "options": {"type": "array", "items": {"type": "string"}}}, "required": ["question"]}},
 ]
+TOOLS += team.TOOLS          # 队友协作：team_list / team_read / team_post（crewlib/team.py）
 
 
 def content_len(c):
@@ -158,7 +161,7 @@ def opening(t):
         via = core.via_label(o.get("via"))
         src = (f"派发方：Claude 对话「{o.get('title') or o.get('first') or '（无标题）'}」" + (f"里的 {via}" if via else "")
                + f"（会话 {o['session']}，目录 {o.get('cwd', '—')}）。"
-               "这个任务只属于这个对话：你的提问（ask_lead）和提交都回到这个对话的组长；别的对话、别的任务的文件不要动。")
+               "这个任务只属于这个对话：你的提问（ask_lead）和提交都回到这个对话的组长；别的对话、别的任务的文件可以读、不要改。")
     else:
         src = f"派发方：{core.origin_label(t)}（不是从 Claude 对话派的）。"
     parts = [f"任务：{t['title']}", src, "", t["prompt"]]
@@ -172,19 +175,24 @@ def opening(t):
         parts += ["", "成果文件（先建骨架，查清一项写一项，不要等全部查完再写）：", *[f"- {f}" for f in t["deliverable"]]]
     if t.get("cutoff"):
         parts += ["", f"截止日：{t['cutoff']}（回测）。只能用这一天及以前公开的信息；web_fetch 只给 archive.org 上截止日之前的存档。"]
+    mates = [x for x in core.list_tasks() if x["id"] != t.get("id") and (
+        (t.get("batch") and x.get("batch") == t.get("batch")) or (t.get("wf") and (x.get("wf") or {}).get("run") == (t.get("wf") or {}).get("run")))]
+    if mates:
+        parts += ["", f"同一批 / 同一工作流的队友（{len(mates)} 个，可以 team_read 读他们的成果、team_post 给他们留言）：",
+                  *[f"- {x['id']}「{x.get('title')}」" for x in mates[:40]]] + ([f"- 另 {len(mates) - 40} 个，team_list 看全部"] if len(mates) > 40 else [])
+    parts += ["", "开工前先 team_list：同一个对话里别的工人已经查到、已经落盘的东西直接用，不要重复做。"]
     parts += ["", f"工作目录：{t['cwd']}。完成后调用 submit_result。"]
     return "\n".join(parts)
 
 
-SUMMARY_MAX = 1500  # 超过就退回让工人压缩
 
 
 def submit_tool(schema):
     props = {
-        "summary": {"type": "string", "description": "凝练汇报，600 字以内：第一句是结论；再用 3–8 条要点写关键数字（带出处）、做了什么、没做到什么。过程、明细、长表格写进文件，这里只放组长做判断需要的东西。"},
+        "summary": {"type": "string", "description": "给组长的汇报，不限字数但要提纯：结论先行；关键数字逐个带出处，写清怎么得出的（口径、推算、取舍理由）、不一致的地方、你的判断和把握程度、没做到什么。有用的写全，没用的不写（不复述任务、不写流水账、不写空话、不贴大段原文）。"},
         "files": {"type": "array", "items": {"type": "string"}, "description": "产出文件路径（最重要的放前面）"},
-        "self_check": {"type": "string", "description": "一两句：用脚本或复读核对了什么、结果如何"},
-        "open_issues": {"type": "array", "items": {"type": "string"}, "description": "未解决的问题、做过的假设，每条一句话"},
+        "self_check": {"type": "string", "description": "核对了什么、怎么核对的（脚本 / 复读原件）、结果如何、哪些没核对"},
+        "open_issues": {"type": "array", "items": {"type": "string"}, "description": "未解决的问题、做过的假设：每条写清是什么、为什么、影响什么"},
     }
     req = ["summary", "files", "self_check", "open_issues"]
     if schema:
@@ -220,12 +228,12 @@ def validate(v, s, at="$"):
     return errs[:20]
 
 
-# 接口报“上下文超长”的几种说法（各家 OpenAI 兼容接口）
+# 接口报“上下文超长”的几种说法（OpenAI 兼容）
 TOO_LONG = re.compile(r"context[_ ]length|maximum context|too long|exceeds? the (model'?s )?(context|maximum)|prompt is too long|input.*too large|exceeds? .*tokens", re.I)
 
 
 def opener(prof):
-    """档案写了 direct（内网网关）就不走环境变量里的代理；否则照常。"""
+    """档案写了 direct（显式禁用代理）就不走环境变量里的代理；否则照常走代理。"""
     return urllib.request.build_opener(urllib.request.ProxyHandler({})) if prof.get("direct") else urllib.request.build_opener()
 
 
@@ -298,7 +306,7 @@ class Worker(threading.Thread):
         self.q = queue.Queue()
         self.cfg = daemon.cfg
         self.task = task
-        self.prof = dict(self.cfg["profiles"].get(task.get("profile") or self.cfg["default_profile"]) or {})
+        self.prof = dict(self.cfg["profiles"].get(core.profile_name(task.get("profile"), self.cfg)) or {})
         if not self.prof:
             self.prof = {"backend": "mock"}
         self.want = None            # 被打断后要落的状态：paused / cancelled / rejected
@@ -308,6 +316,19 @@ class Worker(threading.Thread):
 
     # ───────── 状态与事件
     def ev(self, kind, **kw):
+        full = kw.pop("full_out", None)
+        if kind == "out" and full is not None and len(full) > len(kw.get("text") or ""):
+            # 时间线只记开头（events.jsonl 不撑大），全文另存一份，crew chat / 面板里给路径（工人自己拿到的是完整输出）
+            try:
+                d = os.path.join(self.dir, "outputs")
+                os.makedirs(d, exist_ok=True)
+                self._out_n = getattr(self, "_out_n", 0) + 1
+                p = os.path.join(d, f"{int(core.now() * 1000)}-{self._out_n}.txt")
+                with open(p, "w", encoding="utf-8") as f:
+                    f.write(full)
+                kw["full_path"] = p
+            except OSError:
+                pass
         core.append_event(self.tid, kind, **kw)
 
     def update(self, **kw):
@@ -359,6 +380,7 @@ class Worker(threading.Thread):
         timeout = float(timeout) if timeout else (float(self.cfg.get("bash_timeout_s") or 0) or None)
         env = {**os.environ, **(self.cfg.get("worker_env") or {})}
         env["PATH"] = WORKERBIN + os.pathsep + env.get("PATH", "")
+        env.setdefault("CREW_PYTHON", sys.executable)
         # 登录 shell 的配置可能重排 PATH：命令前再放一次，保证 python3 / pip 是 workerbin 里的
         # 输出写进文件、只等 bash 本身退出：命令里放到后台的进程（cmd & …）还拿着输出也不会卡住这一步；
         # 输出再大也不占后台服务的内存
@@ -400,6 +422,12 @@ class Worker(threading.Thread):
                 return self.view_image(a)
             if name == "web_fetch":
                 return self.web_fetch(a, n)
+            if name == "team_list":
+                return team.team_list(self.d.tasks.get(self.tid) or self.task, a.get("scope") or "team", a.get("status"), a.get("query")), 0
+            if name == "team_read":
+                return team.team_read(str(a.get("id") or ""))
+            if name == "team_post":
+                return team.team_post(self.d.tasks.get(self.tid) or self.task, a.get("text"))
             if name == "report_problem":
                 if self.closing(a):
                     return self.close_reported(a), 0
@@ -448,7 +476,7 @@ class Worker(threading.Thread):
         paths, n = t.get("deliverable") or [], int(t.get("nudge_after") or 0)
         if not paths or not n or turns < n or t.get("deliv_nudged"):
             return None
-        # 任务开始后没新建、也没改写过才算没写（定点重跑时文件是上一轮的旧稿，光看存不存在会漏，11-26 root-09）
+        # 任务开始后没新建、也没改写过才算没写（定点重跑时文件是上一轮的旧稿，光看存不存在会漏）
         since = float(t.get("started") or t.get("created") or 0)
 
         def fresh(p):
@@ -465,7 +493,7 @@ class Worker(threading.Thread):
         self.ev("steer", text=msg, frm="crew")
         return msg
 
-    # ───────── 工人关掉自己报过的告警（11-26：工人用 report_problem 写“关闭前述告警 status=false_alarm”，crew 却新开了一条）
+    # ───────── 工人关掉自己报过的告警
     CLOSE_RE = re.compile(r"status\s*[=:：]\s*[\"']?(false_alarm|resolved|closed)|^\s*(关闭|撤销|撤回|解除)(前述|之前|上述|此前)?[^\n]{0,20}告警")
 
     def closing(self, a):
@@ -507,7 +535,7 @@ class Worker(threading.Thread):
         env = p.get("api_key_env")
         if not env:
             return ""
-        return os.environ.get(env) or load_env_file(p.get("env_file", "")).get(env, "")
+        return os.environ.get(env) or load_env_file(p.get("env_file") or os.path.join(core.HOME, "openai.env")).get(env, "")
 
     def interruptible(self, fn):
         """在辅助线程里等一个阻塞调用；暂停 / 取消时不等它返回。"""
@@ -533,27 +561,27 @@ class Worker(threading.Thread):
         t = self.d.tasks.get(self.tid) or self.task
         fb = getattr(self, "fallback", None)
         name = (fb or {}).get("model") or t.get("model") or self.prof.get("model")
-        mid, info, alias = core.resolve_model(self.cfg, name)
-        if info.get("efforts") == [] or self.prof.get("efforts") == []:
-            return mid, None, alias           # 模型不支持思考档位：不发 reasoning_effort
+        mid, info, alias = (name, {}, name) if self.prof.get("backend") == "codex" and t.get("model") else core.resolve_model(self.cfg, name)
         eff = (self.cfg.get("force_effort") or self.prof.get("force_effort") or (fb or {}).get("effort") or t.get("effort")
                or self.prof.get("effort"))
         return mid, core.fit_effort(eff, info.get("efforts") or self.prof.get("efforts")), alias
 
     def request_body(self, msgs, tools):
         mid, eff, alias = self.model_params()
+        if not mid:
+            raise RuntimeError("gpt-chat 需要在配置或任务中指定 model")
         body = {"model": mid, "messages": msgs, "tools": tools, "tool_choice": "auto"}
         if self.prof.get("temperature") is not None:
             body["temperature"] = self.prof["temperature"]
         if self.prof.get("max_tokens") is not None:
-            # GPT 推理模型要 max_completion_tokens，其他多数接口用 max_tokens
+            # 推理模型要 max_completion_tokens（档案 max_tokens_field），其他接口用 max_tokens
             body[self.prof.get("max_tokens_field") or "max_tokens"] = self.prof["max_tokens"]
         body.update(self.prof.get("extra_body") or {})
         if eff:
             body["reasoning_effort"] = eff
             if eff != "none":
                 body.pop("thinking", None)       # 档案里的“不思考”被任务指定的档位覆盖
-        used = f"{alias}·{eff or '默认'}"
+        used = f"{mid} · {eff or '默认'}"
         if getattr(self, "_used", None) != used:
             self._used = used
             self.update(model_used=used)
@@ -561,7 +589,7 @@ class Worker(threading.Thread):
         return body
 
     def use_fallback(self, err):
-        """模型没开通（404 ModelNotOpen）：按配置换成 fallback（pro → flash·max），记进时间线；换过一次就不再换。"""
+        """模型没开通（404 ModelNotOpen）：按配置换成 models 别名里写的 fallback，记进时间线；换过一次就不再换。"""
         if "ModelNotOpen" not in err or getattr(self, "fallback", None):
             return False
         _, info, alias = self.model_params()
@@ -569,7 +597,7 @@ class Worker(threading.Thread):
         if not fb:
             return False
         self.fallback = fb
-        self.ev("retry", n=0, wait=0, err=f"{alias} 在这个账号上没开通，改用 {fb.get('model')}·{fb.get('effort')}（开通后新任务自动用回 {alias}）")
+        self.ev("retry", n=0, wait=0, err=f"{alias} 在账号上没开通，改用 {fb.get('model')}·{fb.get('effort')}（开通后新任务自动用回 {alias}）")
         return True
 
     def chat(self, body):
@@ -609,6 +637,17 @@ class Worker(threading.Thread):
                     self.ev("retry", n=limited, wait=wait, err=f"限流 429：{txt[:150]}")
                     self.sleep_or_stop(wait)
                     continue
+                if e.code in (401, 403) or re.search(r"AuthenticationError|not active|insufficient_quota|AccountOverdue|Arrearage", txt, re.I):
+                    # 密钥失效 / 欠费：开告警叫醒派活的对话；有 fallback_profile 就改派（同限流）
+                    host = urllib.parse.urlsplit(url).hostname or ""
+                    al = core.raise_alert(f"密钥:{host}", f"{self.pname()} 接口密钥失效或欠费", host, f"HTTP {e.code}: {txt[:250]}", "模型接口",
+                                          self.cfg, self.d.tasks.get(self.tid) or self.task)
+                    seen = set((self.d.tasks.get(self.tid) or self.task).get("alerts") or []) | {al["key"]}
+                    self.update(alerts=sorted(seen))
+                    self.rate_note(False)
+                    fb = self.prof.get("fallback_profile")
+                    if fb and fb in self.cfg["profiles"] and (self.d.tasks.get(self.tid) or self.task).get("fallback") is not False:
+                        raise Stop("switch", f"{self.pname()} 接口密钥失效（HTTP {e.code}），改用 {fb}")
                 if e.code < 500:
                     raise RuntimeError(f"HTTP {e.code}: {txt}")
                 err = f"HTTP {e.code}: {txt}"
@@ -621,7 +660,7 @@ class Worker(threading.Thread):
         raise RuntimeError(f"接口连续失败：{err}")
 
     def pname(self):
-        return self.task.get("profile") or self.cfg.get("default_profile") or "ds"
+        return core.profile_name(self.task.get("profile"), self.cfg)
 
     def rate_note(self, ok):
         f = getattr(self.d, "note_rate", None)
@@ -633,7 +672,7 @@ class Worker(threading.Thread):
             self._limited_since = time.time()
 
     def maybe_switch(self, limited):
-        """这个档案有 fallback_profile（DeepSeek → gpt）：连续被限流超过 fallback_after_s 秒，停下交给后台服务换档案续做。"""
+        """这个档案有 fallback_profile：连续被限流超过 fallback_after_s 秒，停下交给后台服务换档案续做。"""
         t = self.d.tasks.get(self.tid) or self.task
         fb = self.prof.get("fallback_profile")
         since = getattr(self, "_limited_since", None)
@@ -727,7 +766,7 @@ class Worker(threading.Thread):
         first = opening(t)
         if mcp.available(self.cfg):
             first += ("\n\n[crew] 本机的 MCP 数据服务（用 mcp_call 直接调，不用写脚本；参数不确定先 mcp_tools 查）：\n" + mcp.brief(self.cfg)
-                      + "\n要点：结果大的传 save_to 存文件再用 python 处理。")
+                      + "\n结果较大时传 save_to 存文件，再用 Python 处理。")
         known = [a for a in core.list_alerts() if a["status"] == "open" and a.get("important")]
         if known:
             # 开工前就告诉工人哪些源现在是坏的：别在上面白耗，用到的部分直接写进 open_issues
@@ -788,8 +827,9 @@ class Worker(threading.Thread):
         pend = getattr(self, "_images", None)
         if pend is None:
             pend = self._images = []
-        if len(pend) >= 4:
-            return "错误：这一回合已经看了 4 张，先把读到的写下来，下一回合再看", 1
+        cap = int(self.cfg.get("images_per_turn") or 8)
+        if len(pend) >= cap:
+            return f"错误：这一回合已经看了 {cap} 张，先把读到的写下来，下一回合再看", 1
         page = int(a.get("page") or 1)
         out = os.path.join(self.dir, "toolout", f"view-{hashlib.sha1(f'{p}#{page}'.encode()).hexdigest()[:10]}.jpg")
         os.makedirs(os.path.dirname(out), exist_ok=True)
@@ -808,14 +848,15 @@ class Worker(threading.Thread):
         return f"图已附在下一条消息里：{where}（{info['w']}×{info['h']}）。看完把读到的数、文字写进文件：图之后会移出上下文。", 0
 
     def attach_images(self, msgs):
-        """这一回合 view_image 看的图：工具回执之后补一条带图的消息（工具消息里放不了图）。只留最近 6 张在上下文里。"""
+        """这一回合 view_image 看的图：工具回执之后补一条带图的 user 消息（OpenAI 的 tool 消息放不了图，统一用 user 消息）。
+        上下文只留最近 images_in_context 张（默认 12）。"""
         pend = getattr(self, "_images", None) or []
         if pend:
             self._images = []
             content = [{"type": "text", "text": "[view_image] " + "；".join(x["label"] for x in pend)}]
             content += [{"type": "image_url", "image_url": {"url": x["url"]}} for x in pend]
             msgs.append({"role": "user", "content": content})
-        return strip_images(msgs, keep=int(self.cfg.get("images_in_context") or 6))
+        return strip_images(msgs, keep=int(self.cfg.get("images_in_context") or 12))
 
     # ───────── 网页
     def web_fetch(self, a, n):
@@ -835,7 +876,7 @@ class Worker(threading.Thread):
                 return f"错误：查 archive.org 存档失败：{type(e).__name__}: {e}", 1
             if len(rows) < 2:
                 return (f"archive.org 上没有 {url} 在截止日 {cutoff} 之前的存档。这是回测项目，不能看现在的网页（会泄露截止日之后的信息）："
-                        "换别的来源（截止日前的原始文件），或写进 open_issues。"), 1
+                        "换别的来源（截止日前的原始文件、可用存档），或写进 open_issues。"), 1
             snap, orig = rows[-1][0], rows[-1][1]
             fetch = f"https://web.archive.org/web/{snap}id_/{orig}"
             meta.update(source="archive.org", snapshot=snap, cutoff=cutoff, archive_url=fetch)
@@ -952,6 +993,8 @@ class Worker(threading.Thread):
         有 msgs.json 就接着 chat；新任务按档案（backend: codex）。"""
         if os.path.exists(os.path.join(self.dir, "codex.json")):
             return "codex"
+        if os.path.exists(os.path.join(self.dir, "claude.json")):
+            return "claude"
         if os.path.exists(self.msgs_path()):
             return "chat"
         return self.prof.get("backend") or "chat"
@@ -971,6 +1014,9 @@ class Worker(threading.Thread):
         if self.backend() == "codex":
             from . import codexrun
             return codexrun.run(self)
+        if self.backend() == "claude":
+            from . import clauderun
+            return clauderun.run(self)
         msgs = core.read_json(self.msgs_path()) or self.initial()
         msgs = self.fix_dangling(msgs)
         schema = t.get("schema")
@@ -1061,8 +1107,6 @@ class Worker(threading.Thread):
                     continue
                 if name == "submit_result":
                     errs = validate(a, submit_tool(schema)["parameters"])
-                    if not errs and len(str(a.get("summary") or "")) > SUMMARY_MAX:
-                        errs = [f"summary 有 {len(a['summary'])} 字，太长：压到 600 字以内（结论 + 3–8 条要点），过程和明细写进文件再列进 files"]
                     if errs:
                         msgs.append({"role": "tool", "tool_call_id": tc["id"], "content": "被拒绝，改好再提交：\n" + "\n".join(errs)})
                         self.ev("tool", name=name, arg="（格式不合格）", code=1)
@@ -1079,7 +1123,7 @@ class Worker(threading.Thread):
                 self.ev("tool", name=name, arg=preview_args(name, a), **({"full": full} if full else {}))
                 out, code = self.exec_tool(name, a)
                 msgs.append({"role": "tool", "tool_call_id": tc["id"], "content": out})
-                self.ev("out", name=name, code=code, text=out[:4000], chars=len(out))
+                self.ev("out", name=name, code=code, text=out[:4000], chars=len(out), full_out=out)
                 if self.want:
                     break
             # 同一回合里没执行到的调用（被暂停打断、或多个提问只留第一个）补上回执，保持消息序列合法

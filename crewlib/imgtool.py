@@ -1,6 +1,6 @@
 """把图片或 PDF 的一页转成给模型看的 JPEG（工人的 view_image 用）。
 用法：python3 imgtool.py <源文件> <输出.jpg> [页码，从 1 开始] [长边像素上限]
-用工人那个 Python 跑（workerbin/python3：带 PyMuPDF 和 Pillow）。输出一行 JSON。"""
+用工人那个 Python 跑（workerbin/python3：需安装 PyMuPDF 和 Pillow）。输出一行 JSON。"""
 import io
 import json
 import sys

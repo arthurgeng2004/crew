@@ -1,4 +1,4 @@
-"""crew 托管的工作流：Claude 写脚本（Claude Code Workflow 的写法），crew 用 Node 跑，每个 agent() 是一个 DeepSeek 工人任务。
+"""crew 托管的工作流：Claude 写脚本（Claude Code Workflow 的写法），crew 用 Node 跑，每个 agent() 是一个工人任务（默认 GPT，跑在 Codex 里）。
 
   workflows/<id>/run.json      运行规格（这里写）        script.js   脚本副本
   workflows/<id>/state.json    进度快照（运行器写）      journal.jsonl  每个 agent() 的开始 / 结果（续跑用）
@@ -28,7 +28,13 @@ def wdir(wid):
 
 
 def node():
-    return shutil.which("node") or "/usr/local/bin/node"
+    binary = shutil.which("node")
+    if not binary:
+        raise RuntimeError("工作流需要 Node.js 18+；请安装 node 并加入 PATH")
+    major = int(subprocess.check_output([binary, "-p", "process.versions.node.split('.')[0]"], text=True, timeout=10).strip())
+    if major < 18:
+        raise RuntimeError("工作流需要 Node.js 18+")
+    return binary
 
 
 def check(script_path):
@@ -64,7 +70,7 @@ def create(spec, owner):
     run = {
         "id": wid, "name": meta["name"], "description": meta.get("description", ""), "phases": meta.get("phases") or [],
         "args": spec.get("args"), "cwd": os.path.abspath(os.path.expanduser(spec.get("cwd") or os.getcwd())),
-        "profile": spec.get("profile") or None, "model": spec.get("model") or None, "effort": spec.get("effort") or None, "concurrency": int(spec.get("concurrency") or meta.get("concurrency") or core.config().get("wf_concurrency") or 0),
+        "profile": spec.get("profile") or None, "model": spec.get("model") or None, "effort": spec.get("effort") or None, "concurrency": int(spec.get("concurrency") or meta.get("concurrency") or 0),
         "owner": owner, "origin": core.make_origin(owner, spec.get("origin")), "created": core.now(),
         "script_path": spec.get("script_path") or "",
     }
@@ -85,7 +91,7 @@ def load(wid):
     w.setdefault("agents", [])
     w.setdefault("logs", [])
     w["proc"] = proc
-    if w["status"] == "running" and st.get("beat") and core.now() - st["beat"] > 30 and not pid_alive(proc.get("pid")):
+    if w["status"] == "running" and st.get("beat") and core.now() - st["beat"] > 30 and not pid_alive(proc.get("pid"), proc.get("start")):
         w["status"] = "starting"     # 运行器没了，后台服务会拉起续跑
     return w
 
@@ -107,25 +113,21 @@ def resolve(prefix):
     raise SystemExit(f"找不到唯一的工作流：{prefix}（匹配 {len(hits)} 个）")
 
 
-def pid_alive(pid):
+def pid_alive(pid, start=None):
     if not pid:
         return False
     try:
-        got, _ = os.waitpid(pid, os.WNOHANG)       # 是后台服务的子进程：顺手回收僵尸
+        got, _ = os.waitpid(pid, os.WNOHANG)
         if got:
             return False
     except ChildProcessError:
         pass
     except OSError:
         return False
-    try:
-        with open(f"/proc/{pid}/stat") as f:
-            if f.read().split(")")[-1].split()[0] == "Z":
-                return False
-        with open(f"/proc/{pid}/cmdline", "rb") as f:
-            return b"wfrun" in f.read()       # 机器重启后 pid 可能被别的进程占了：要真是运行器
-    except OSError:
-        return False
+    from .platform import process_info
+    info = process_info(pid)
+    return bool(info and not info[2].startswith("Z") and RUNNER in info[1]
+                and (not start or info[0] == start))
 
 
 def counts(w):
@@ -262,7 +264,7 @@ def render(tr, width=110):
 
 
 def digest(w):
-    """工作流结束时交给 Claude 的凝练结果。"""
+    """工作流结束时交给 Claude 的结果：返回值全文，不截断。"""
     r = row(w)
     c = r["counts"]
     lines = [f"工作流 {w['id']}「{w['name']}」{ZH.get(w['status'])} · 用时 {core.fmt_secs(r['elapsed'])} · 代理 {r['agents']} 个"
@@ -275,7 +277,7 @@ def digest(w):
     res = core.read_json(os.path.join(wdir(w["id"]), "result.json"))
     if res is not None:
         s = json.dumps(res.get("value"), ensure_ascii=False, indent=1)
-        lines.append("返回值：" + (s if len(s) <= 3000 else s[:3000] + f"…（共 {len(s)} 字，全文：crew wf result {w['id']}）"))
+        lines.append("返回值：" + s)
     return "\n".join(lines)
 
 
@@ -302,7 +304,9 @@ class Host:
             self.log(f"工作流 {wid} 运行器起不来：{e}")
             return
         self.procs[wid] = p
-        core.write_json(os.path.join(d, "proc.json"), {"pid": p.pid, "host": core.host_id(), "t": core.now()})
+        from .platform import process_info
+        info = process_info(p.pid)
+        core.write_json(os.path.join(d, "proc.json"), {"pid": p.pid, "host": core.host_id(), "t": core.now(), "start": info[0] if info else None})
         self.log(f"工作流 {wid} 运行器启动（{why}）pid {p.pid}")
 
     def scan(self):
@@ -317,7 +321,7 @@ class Host:
                 continue
             proc = core.read_json(os.path.join(d, "proc.json")) or {}
             here = proc.get("host") in (None, core.host_id())
-            alive = here and (wid in self.procs or pid_alive(proc.get("pid")))
+            alive = here and (wid in self.procs or pid_alive(proc.get("pid"), proc.get("start")))
             if os.path.exists(cancel) and not alive:
                 # 取消时运行器不在：在这里收尾（运行器在的话它自己收尾），不再拉起
                 self.finish_cancel(wid)
@@ -376,7 +380,7 @@ def cmd(a):
             spec = json.load(sys.stdin)
         else:
             spec = {"script_path": a.script, "args": json.loads(a.args) if a.args else None, "cwd": a.cwd, "profile": a.profile,
-                    "model": a.model, "effort": a.effort, "concurrency": a.concurrency}
+                    "model": a.model, "effort": a.effort}
         run = create(spec, a.owner)
         _ensure()
         msg = {"id": run["id"], "name": run["name"], "phases": [p["title"] for p in run["phases"]]}
@@ -445,7 +449,7 @@ def cmd(a):
     elif act == "resume":
         wid = resolve(a.id)
         w = load(wid)
-        if pid_alive((w.get("proc") or {}).get("pid")):
+        if pid_alive((w.get("proc") or {}).get("pid"), (w.get("proc") or {}).get("start")):
             print(f"{wid} 正在运行")
             return
         open(os.path.join(wdir(wid), "ctl", "start"), "w").close()
@@ -454,7 +458,7 @@ def cmd(a):
     elif act == "rm":
         wid = resolve(a.id)
         w = load(wid)
-        if w["status"] not in DONE and pid_alive((w.get("proc") or {}).get("pid")):
+        if w["status"] not in DONE and pid_alive((w.get("proc") or {}).get("pid"), (w.get("proc") or {}).get("start")):
             raise SystemExit(f"{wid} 还在运行，先 crew wf cancel")
         shutil.rmtree(wdir(wid))
         print(f"已删除 {wid}（代理任务留着，crew rm 另删）")
@@ -468,9 +472,8 @@ def add_parser(sub):
     s.add_argument("--args", help="JSON")
     s.add_argument("--cwd")
     s.add_argument("--profile")
-    s.add_argument("--model", help="整个工作流的默认模型：flash / haiku / sonnet / opus / fable")
+    s.add_argument("--model", help="整个工作流的默认模型：原样传给工人（Codex 认得的模型名）；不写就用 Codex 自己的默认模型")
     s.add_argument("--effort", help="整个工作流的默认思考档位：none / low / medium / high / xhigh / max")
-    s.add_argument("--concurrency", type=int, help="这个工作流里同时跑几个 agent()（0 = 不限；默认取脚本 meta.concurrency，再取配置 wf_concurrency）")
     s.add_argument("--stdin", action="store_true")
     s.add_argument("--owner", default="cli")
     s = ws.add_parser("check", help="只检查脚本格式")
@@ -482,7 +485,7 @@ def add_parser(sub):
         s = ws.add_parser(name, help="进度树" if name == "show" else "实时进度（每 2 秒刷新）")
         s.add_argument("id")
         s.add_argument("-v", "--verbose", type=int, default=0, help="每个代理再显示最近 N 步")
-    s = ws.add_parser("result", help="结果（默认凝练版；--full 完整返回值）")
+    s = ws.add_parser("result", help="结果（返回值全文；--full 原始 JSON）")
     s.add_argument("id")
     s.add_argument("--full", action="store_true")
     for name in ("cancel", "resume", "rm"):

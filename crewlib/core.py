@@ -36,127 +36,67 @@ STATUS_ZH = {
     "review": "待验收", "accepted": "通过", "rejected": "否决", "failed": "失败", "cancelled": "取消",
 }
 
-DEFAULT_CONFIG = {
-    "max_parallel": 0,          # 全局同时跑几个工人，0 = 不限：派多少跑多少（crew parallel 8 改）
-    "wf_concurrency": 0,        # 工作流里同时跑几个 agent() 的默认上限，0 = 不限（脚本 meta.concurrency、run --concurrency 优先）
-    "default_profile": "ds",
-    # 全局强制思考档位（设了就压过一切，任务里写的 effort 也不管用）。默认不设：按档案 / 任务里写的。
-    "force_effort": None,
-    # 模型别名：任务 / 工作流 / 档案里写 model: "<别名>"（或完整模型 id）。
-    # efforts = 该模型支持的思考档位；window = 上下文窗口（含回复）；可写 fallback: {model, effort}：没开通时自动改用。
-    "models": {
-        "deepseek": {"id": "deepseek-chat", "efforts": [], "window": 131072},
-        "gpt": {"id": "gpt-5", "efforts": ["minimal", "low", "medium", "high"]},
-    },
-    # 上下文多长时压缩（按 token 计，用接口返回的实际用量校准）。任务 / 档案的 context_tokens 优先；
-    # 都没写就按模型窗口：窗口 − 回复上限 − 4 万余量。再没有窗口信息才用这里的默认。
-    "defaults": {"context_tokens": 300000},
-    "profiles": {
-        # 默认工人：任何 OpenAI 兼容的 chat/completions 接口都行（DeepSeek 官方、火山方舟、硅基流动、vLLM……）。
-        # 密钥从 env_file（一行 KEY=VALUE）或同名环境变量读取，不写进配置。
-        "ds": {
-            "base_url": "https://api.deepseek.com/v1",
-            "api_key_env": "DEEPSEEK_API_KEY",
-            "env_file": "~/.crew/deepseek.env",
-            # 被限流（429）时改派给哪个档案；运行中的连续 429 超过 fallback_after_s 秒换档案接着做。None = 不改派
-            "fallback_profile": None,
-            "fallback_after_s": 180,
-            "model": "deepseek",
-            "effort": None,               # 默认思考档位；派活 / 工作流里写 effort 可以按任务改
-            "temperature": 0.3,
-            "max_tokens": 8192,           # 回复上限（推理 + 回答）
-            "request_timeout_s": 900,
-            "retries": 6,
-            "vision": False,              # 模型能看图就设 True：给工人 view_image
-            "price_per_mtok": None,       # {"in":…, "out":…, "cached":…}，每百万 token 单价，填了就显示成本
-        },
-        "ds-fast": {
-            "base_url": "https://api.deepseek.com/v1",
-            "api_key_env": "DEEPSEEK_API_KEY",
-            "env_file": "~/.crew/deepseek.env",
-            "fallback_profile": None,
-            "fallback_after_s": 180,
-            "model": "deepseek",
-            "effort": None,
-            "temperature": 0.2,
-            "max_tokens": 4096,
-            "request_timeout_s": 600,
-            "retries": 6,
-            "vision": False,
-            "price_per_mtok": None,
-        },
-        # GPT 工人（可选）：跑在本机已登录的 Codex 里（ChatGPT 账号登录或 API key 登录都行，crew 不碰密钥）。
-        # 每个任务起一个 codex app-server，拿到 Codex 原生的 shell / apply_patch / MCP / skills / 上下文压缩；
-        # 模型、网关、MCP 都读 ~/.codex/config.toml。model 为 None = 用 Codex 的默认模型；要固定就写模型 id。
-        # 没装 Codex 就用下面的 gpt-chat（直接调 OpenAI 接口，要 API key）。
-        "gpt": {
-            "model": None,
-            "effort": None,                                # None = Codex 的默认思考档位
-            "temperature": None,
-            "max_tokens": 32768,
-            "max_tokens_field": "max_completion_tokens",   # 推理模型不认 max_tokens
-            "efforts": ["minimal", "low", "medium", "high"],
-            "models": [],                                  # 非空时只允许派这些模型（派活写别的会报错）
-            "context_tokens": 200000,
-            "max_parallel": 4,                             # 同组（parallel_group）同时最多几个，超出的排队
-            "parallel_group": "gpt",
-            "request_timeout_s": 900,
-            "retries": 6,
-            "vision": True,
-            "price_per_mtok": None,
-            "backend": "codex",
-            "codex_bin": "codex",
-            "codex_skill_roots": ["~/.crew/codex-skills"],   # 额外 skills 目录
-            "codex_subagents": False,                        # Codex 子代理会绕过并发名额，默认关
-            # 可用时段（UTC，可跨午夜，如 "09:30-01:00"）：时段外新任务排队，运行中的到点暂停、下个时段续跑
-            "hours": None,
-        },
-        # 不用 Codex：crew 自己的 chat/completions 工具循环
-        "gpt-chat": {
-            "base_url": "https://api.openai.com/v1", "api_key_env": "OPENAI_API_KEY", "env_file": "~/.crew/openai.env", "direct": False,
-            "model": "gpt", "effort": "high", "temperature": None, "max_tokens": 32768, "max_tokens_field": "max_completion_tokens",
-            "efforts": ["minimal", "low", "medium", "high"], "models": [],
-            "context_tokens": 200000, "max_parallel": 4, "parallel_group": "gpt", "request_timeout_s": 900, "retries": 6, "vision": True,
-        },
-        # 不调模型，走一遍状态机（测试用）
-        "mock": {"backend": "mock"},
-    },
-    "tool_output_chars": 8000,
-    # 故障告警：工具输出里出现这些特征 = 数据源 / 服务坏了（不是“没有数据”）。crew 记下来、提示工人、唤醒派活的 Claude 对话。
-    # [名字, 正则]；正则不分大小写。脚本可以直接打印一行 [CREW-ALERT] 说明 来报告。
-    "alert_patterns": [
-        ["脚本报告故障", r"^\[CREW-ALERT(?::[\w.-]+)?\][^\n]*"],
-        ["上游服务 5xx", r"UPSTREAM_5XX|upstream_status\"?\s*:\s*5\d\d|HTTP Error 5\d\d|\b5\d\d (Bad Gateway|Service Unavailable|Gateway Time-?out|Internal Server Error)|\b5\d\d from https?://"],
-        ["连不上服务", r"Connection refused|ECONNREFUSED|服务连不上|Failed to establish a new connection|Name or service not known|No route to host|Temporary failure in name resolution"],
-        ["密钥或额度", r"invalid[_ ]api[_ ]key|insufficient_quota|quota exceeded|ModelNotOpen|AuthenticationError"],
-    ],
-    # 这些地址（子串）出故障一律叫醒 Claude（你的数据接口、本机 MCP）；别的地址同一故障出现 3 次或波及 2 个任务才叫
-    "alert_watch": ["127.0.0.1", "localhost", "mcp-"],
-    # 工人的 MCP 数据服务（mcp_tools / mcp_call）。{名字: {"url": "http://…/mcp", "purpose": "一句话用途", "headers": {…}}}；
-    # 只支持 streamable HTTP。为空且 mcp_from_claude_json 为 false 时不给工人这两个工具。
-    "mcp_servers": {},
-    "mcp_from_claude_json": False,  # True = 另外读 ~/.claude.json 里 url 是 http(s) 的 mcpServers
-    # 自定义桥（高级）：一个 Python 文件，提供 server_urls() -> {名字: url} 和 _rpc(server, method, params, timeout, url=None) -> (应答, 错误)
-    "mcp_bridge": None,
-    "mcp_timeout_s": 180,
-    # 巡检：后台服务定期跑这些命令，退出码非 0 = 故障（开告警），恢复后自动解除并通知。
-    # 例：{"name": "行情库", "key": "quotes", "cmd": "python3 ~/bin/quotes_ping.py", "every_s": 600, "every_fail_s": 180, "timeout_s": 120, "match": ["quotes"]}
-    "probes": [],
-    "bash_timeout_s": 600,      # 工人单条 bash 命令默认 10 分钟超时（0 = 不限）；工人可传 timeout_s 放宽
-    # 工人跑命令时的环境：PATH 前面加 crew/workerbin（python3 / pip 指向 CREW_PYTHON 或系统 python3），再加这些环境变量
-    "worker_env": {},
-    # 写进工人守则的“环境说明”：换机器时只改这里
-    "worker_env_note": (
-        "环境：\n"
-        "- 命令不需要任何确认、没有沙箱；只写任务允许写的位置。\n"
-        "- 缺 Python 库就 pip install。网络请求自己加超时（curl -m、requests timeout），连两次不上就换来源，不要反复重试。\n"
-        "- 没有回合上限：一直做到任务真正完成，再调用 submit_result 交给组长。"
-    ),
-}
+DEFAULT_CONFIG = {'max_parallel': 4,
+ 'default_profile': 'gpt',
+ 'force_effort': None,
+ 'models': {},
+ 'defaults': {'context_tokens': 200000},
+ 'profiles': {'gpt': {'backend': 'codex',
+                      'codex_bin': 'codex',
+                      'model': None,
+                      'effort': None,
+                      'max_parallel': 4,
+                      'parallel_group': 'gpt',
+                      'codex_subagents': False,
+                      'codex_skill_roots': []},
+              'gpt-chat': {'backend': 'chat',
+                           'base_url': 'https://api.openai.com/v1',
+                           'api_key_env': 'OPENAI_API_KEY',
+                           'env_file': None,
+                           'model': None,
+                           'effort': None,
+                           'max_tokens': 16384,
+                           'max_tokens_field': 'max_completion_tokens',
+                           'max_parallel': 4,
+                           'parallel_group': 'gpt',
+                           'request_timeout_s': 900,
+                           'retries': 6,
+                           'vision': True},
+              'claude': {'backend': 'claude',
+                         'claude_bin': 'claude',
+                         'model': None,
+                         'effort': None,
+                         'max_parallel': 2,
+                         'quota_stop': 0.9,
+                         'retries': 4,
+                         'vision': True,
+                         'explicit_only': True},
+              'mock': {'backend': 'mock'}},
+ 'tool_output_chars': 8000,
+ 'peer_cache_margin_s': 180,
+ 'alert_patterns': [['脚本报告故障', '^\\[CREW-ALERT(?::[\\w.-]+)?\\][^\\n]*'],
+                    ['上游服务 5xx',
+                     'UPSTREAM_5XX|upstream_status\\"?\\s*:\\s*5\\d\\d|HTTP Error 5\\d\\d|\\b5\\d\\d (Bad '
+                     'Gateway|Service Unavailable|Gateway Time-?out|Internal Server Error)|\\b5\\d\\d from '
+                     'https?://'],
+                    ['连不上服务',
+                     'Connection refused|ECONNREFUSED|服务连不上|Failed to establish a new connection|Name or '
+                     'service not known|No route to host|Temporary failure in name resolution'],
+                    ['密钥或额度',
+                     'invalid[_ ]api[_ ]key|insufficient_quota|quota '
+                     'exceeded|ModelNotOpen|AuthenticationError']],
+ 'alert_watch': ['127.0.0.1', 'localhost'],
+ 'mcp_servers': {},
+ 'mcp_env_file': None,
+ 'mcp_timeout_s': 180,
+ 'probes': [],
+ 'bash_timeout_s': 600,
+ 'worker_env': {},
+ 'worker_env_note': '环境：只写任务允许的位置。python3 / pip 使用安装时选择的 Python，可用 CREW_PYTHON '
+                    '覆盖；缺少的依赖按任务需要安装。网络请求应设置超时。完成后调用 submit_result。'}
 
-
-# 思考档位从低到高。DeepSeek 只有 none / low / high / max，GPT 有 minimal / low / medium / high（新款还有 none、xhigh）：
-# 写哪个都行，落到模型支持的最近一档（同样近取高的），所以 medium 给 DeepSeek 是 high、max 给 GPT 是它的最高档
+# 思考档位从低到高；Claude Code 的 low / medium / high / xhigh / max 照收。
+# 写哪个都行，落到模型支持的最近一档（同样近取高的）
 EFFORT_ORDER = ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
 EFFORT_ALIAS = {"off": "none"}
 
@@ -186,22 +126,28 @@ def resolve_model(cfg, name):
     return name, {}, name
 
 
+
+
+def model_label(t, cfg):
+    """任务实际用的模型和后端。
+    旧任务记的是别名（gpt·high·codex），按当时的别名换成完整名。"""
+    used = str(t.get("model_used") or "")
+    if used:
+        parts = [x.strip() for x in used.replace("·", " · ").split("·") if x.strip()]
+        if parts:
+            parts[0] = resolve_model(cfg, parts[0])[0]
+            parts = [("Codex" if x == "codex" else "Claude" if x == "claude" else x) for x in parts]
+        return " · ".join(parts)
+    if t.get("status") != "queued":
+        return ""                       # 没开过工（或很早的任务没记）：不猜
+    prof = (cfg.get("profiles") or {}).get(profile_name(t.get("profile"), cfg)) or {}
+    mid = resolve_model(cfg, t.get("model") or prof.get("model") or "")[0]
+    eff = t.get("effort") or prof.get("effort")
+    return " · ".join(x for x in (mid, eff) if x) + "（待开工）" if mid else ""
+
+
 def now():
     return time.time()
-
-
-def in_hours(prof, t=None):
-    """档案的可用时段（hours: "09:30-01:00"，UTC，可跨午夜）。没设 = 随时可用。"""
-    h = (prof or {}).get("hours")
-    if not h:
-        return True
-    try:
-        a, b = [int(x.split(":")[0]) * 60 + int(x.split(":")[1]) for x in str(h).split("-")]
-    except (ValueError, IndexError):
-        return True
-    g = time.gmtime(t or time.time())
-    cur = g.tm_hour * 60 + g.tm_min
-    return a <= cur < b if a < b else (cur >= a or cur < b)
 
 
 def stamp(t=None):
@@ -375,11 +321,7 @@ _last_cfg = {}
 
 
 def host_id():
-    try:
-        with open("/proc/sys/kernel/hostname") as f:
-            return f.read().strip()
-    except OSError:
-        return socket.gethostname()
+    return socket.gethostname()
 
 
 def transcript_path(sid):
@@ -389,6 +331,71 @@ def transcript_path(sid):
     root = os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude")
     hits = glob.glob(os.path.join(root, "projects", "*", f"{glob.escape(sid)}*.jsonl"))
     return max(hits, key=os.path.getmtime) if hits else None
+
+
+def profile_name(name, cfg=None):
+    """任务用的档案名：没写、或写的档案不存在，都用 default_profile。"""
+    cfg = cfg or config()
+    name = name or cfg.get("default_profile") or "gpt"
+    return name if name in cfg["profiles"] else (cfg.get("default_profile") or "gpt")
+
+
+def _iso_ts(v):
+    """ISO 时间串（2026-11-27T05:30:00.123Z）→ epoch 秒；不认得返回 0。"""
+    import datetime as _dt
+    try:
+        return _dt.datetime.fromisoformat(str(v).replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return 0
+
+
+def session_activity(sid):
+    """对话最后一次模型请求的时间、提示缓存 TTL、上下文大小（只看主线，不看子代理）。
+    提示缓存从最后一次请求起算 TTL（Claude Code 记在 promptCacheRequested：1h / 5m）；过了 TTL 缓存就没了，
+    再发消息过去它要按写入价重写整个上下文。Claude Code 右下角的 "new task? /clear to save N tokens"
+    是闲置 ≥ 75 分钟（CLAUDE_CODE_IDLE_THRESHOLD_MINUTES）且上下文 ≥ 10 万 token（CLAUDE_CODE_IDLE_TOKEN_THRESHOLD）
+    时出的提示，比缓存过期晚，不能拿它判断。"""
+    path = transcript_path(sid)
+    info = {"transcript": path or "", "last_request": 0, "ttl_s": 3600, "context_tokens": 0}
+    if not path:
+        return info
+    try:
+        size = os.path.getsize(path)
+        for span in (1 << 20, 16 << 20):
+            with open(path, "rb") as f:
+                f.seek(max(0, size - span))
+                lines = f.read().decode("utf-8", "replace").splitlines()
+            for line in reversed(lines):
+                if '"type":"assistant"' not in line or '"isSidechain":true' in line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if d.get("type") != "assistant" or d.get("isSidechain"):
+                    continue
+                info["last_request"] = _iso_ts(d.get("timestamp"))
+                ttl = str(d.get("promptCacheRequested") or "1h")
+                info["ttl_s"] = 300 if ttl.endswith("m") and ttl[:-1] == "5" else (int(ttl[:-1]) * 60 if ttl.endswith("m") and ttl[:-1].isdigit() else 3600)
+                u = (d.get("message") or {}).get("usage") or {}
+                info["context_tokens"] = int(u.get("input_tokens") or 0) + int(u.get("cache_read_input_tokens") or 0) + int(u.get("cache_creation_input_tokens") or 0)
+                return info
+            if span >= size:
+                break
+    except OSError:
+        pass
+    return info
+
+
+def cache_state(s, act=None):
+    """对方对话的提示缓存还在不在：{warm, idle_s, left_s, ...activity}。忙（正在跑回合）算在；从没请求过也算在（没有可丢的缓存）。"""
+    act = act or session_activity(s.get("sessionId") or s.get("session") or "")
+    last = act.get("last_request") or 0
+    idle = max(0, now() - last) if last else 0
+    left = act["ttl_s"] - idle if last else act["ttl_s"]
+    margin = int(config().get("peer_cache_margin_s") or 180)
+    warm = s.get("status") == "busy" or not last or left > margin
+    return dict(act, warm=bool(warm), idle_s=int(idle), left_s=int(left))
 
 
 def session_info(sid):
@@ -498,7 +505,7 @@ def session_topic(sid):
 
 
 def origin_label(t, width=None):
-    """一行说清派发来源：对话主题「…」› workflow / 子代理 · 脚本；找不到主题才写编号；不是从对话派的写派发者（你 / cli / 脚本名）。"""
+    """一行说清派发来源：对话主题「…」› workflow / 子代理 · 脚本；找不到主题才写编号；不是从对话派的写派发者（你 / cli / script）。"""
     o = t.get("origin") or {}
     owner = str(t.get("owner") or o.get("owner") or "—")
     sid = o.get("session") or (owner[7:] if owner.startswith("claude:") else "")

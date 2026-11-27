@@ -1,9 +1,25 @@
 #!/bin/sh
-# crew 工人用的 Python：优先 $CREW_PYTHON（比如一个装好 pandas / openpyxl / PyMuPDF 等库的 conda 环境），
-# 否则用 PATH 上的 python3（跳过本目录，免得自己调自己）。
-if [ -n "$CREW_PYTHON" ] && [ -x "$CREW_PYTHON" ]; then exec "$CREW_PYTHON" "$@"; fi
-here=$(cd "$(dirname "$0")" && pwd)
-PATH=$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF "$here" | paste -sd: -)
-export PATH
-py=$(command -v python3) && exec "$py" "$@"
-echo "没有可用的 python3（可设 CREW_PYTHON）" >&2; exit 127
+# Interpreter selection is per installation, never embedded in this repository.
+if [ -n "${CREW_PYTHON:-}" ]; then
+  exec "$CREW_PYTHON" "$@"
+fi
+crew_state=${CREW_HOME:-$HOME/.crew}
+if [ -r "$crew_state/python-path" ]; then
+  IFS= read -r crew_python < "$crew_state/python-path"
+  if [ -x "$crew_python" ]; then exec "$crew_python" "$@"; fi
+fi
+crew_workerbin=$(CDPATH='' cd -P "$(dirname "$0")" && pwd) || exit 1
+crew_search=$PATH
+while :; do
+  crew_part=${crew_search%%:*}
+  crew_candidate=${crew_part:-.}/python3
+  if [ -x "$crew_candidate" ]; then
+    crew_parent=$(CDPATH='' cd -P "${crew_part:-.}" 2>/dev/null && pwd)
+    if [ "$crew_parent" != "$crew_workerbin" ] && ! [ "$crew_candidate" -ef "$0" ]; then
+      exec "$crew_candidate" "$@"
+    fi
+  fi
+  case "$crew_search" in *:*) crew_search=${crew_search#*:} ;; *) break ;; esac
+done
+printf '%s\n' '找不到 Python 3.9+：请设置 CREW_PYTHON 为 Python 可执行文件路径。' >&2
+exit 127

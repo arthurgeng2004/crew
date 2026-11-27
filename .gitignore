@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+# Claude Code 生成的插件类型
+plugin/.claude-plugin/types/
+# 密钥和本地状态永远不进仓库
+*.env
+.env*
+.crew/
+node_modules/

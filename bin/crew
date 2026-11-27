@@ -1,0 +1,30 @@
+#!/usr/bin/env python3
+"""crew：Claude 带队、便宜的模型干活。见仓库 README.md。"""
+import os
+import sys
+
+# 面板要 UTF-8 区域设置才能显示中文。SSH 进来常常没带 LANG，或者带的是本机没装的（Mac 终端发来的 en_US.UTF-8）：
+# 真的试一下能不能用，不能用就换成 C.UTF-8 再重启自己（精简容器借宿主机的区域数据）。
+def _locale_ok():
+    import locale
+    try:
+        locale.setlocale(locale.LC_ALL, "")
+    except locale.Error:
+        return False
+    return "utf" in (locale.setlocale(locale.LC_CTYPE) or "").lower().replace("-", "")
+
+
+if not os.environ.get("CREW_REEXEC") and not _locale_ok():
+    env = dict(os.environ, CREW_REEXEC="1")
+    for locpath in ("/usr/lib/locale", "/host/usr/lib/locale"):
+        if os.path.isdir(os.path.join(locpath, "C.utf8")) or os.path.isdir(os.path.join(locpath, "C.UTF-8")):
+            env["LC_ALL"] = "C.UTF-8"
+            if locpath != "/usr/lib/locale":
+                env["LOCPATH"] = locpath
+            os.execve(sys.executable, [sys.executable, os.path.realpath(__file__)] + sys.argv[1:], env)
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+
+from crewlib.cli import main  # noqa: E402
+
+main()

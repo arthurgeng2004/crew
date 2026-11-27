@@ -4,6 +4,7 @@ export type CrewPlan = { every: number; eta: number | null; start: number; next:
 export type CrewTask = {
   id: string
   title: string
+  model?: string
   status: string
   round: number
   turns: number
@@ -14,6 +15,8 @@ export type CrewTask = {
   session: string
   note: string
   question: string | null
+  finished: number | null
+  updated: number | null
   needs_since: number | null
   batch?: string
   wf: string

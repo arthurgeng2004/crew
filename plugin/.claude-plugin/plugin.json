@@ -1,6 +1,6 @@
 {
   "name": "crew",
   "version": "0.1.0",
-  "description": "Claude 带队、DeepSeek 干活：派任务、实时面板、插话、提问、验收回路",
+  "description": "Claude 带队、GPT 工人（Codex）干活：派任务、实时面板、插话、提问、验收回路",
   "types": "./types/index.d.ts"
 }

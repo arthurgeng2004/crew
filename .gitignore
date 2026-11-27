@@ -6,4 +6,10 @@ plugin/.claude-plugin/types/
 *.env
 .env*
 .crew/
+# 本机 Claude / MCP 配置与消息记录可能包含公司资产
+.mcp.json
+.claude.json
+.claude/
+*.sock
+messages.jsonl
 node_modules/

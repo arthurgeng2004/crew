@@ -4,6 +4,9 @@
 
 > English summary: crew lets Claude Code act as a team lead that dispatches work to cheaper LLM "workers" (DeepSeek or any OpenAI-compatible model) running in a background daemon. Workers have bash, file tools and optional MCP access. Claude reviews results (accept / revise / reject) and is woken up automatically when workers finish, ask questions or fail. Hosted workflows (`agent()` / `parallel()` / `pipeline()` scripts) keep running even after Claude exits. UI strings are in Chinese.
 
+> [!IMPORTANT]
+> 目前仅支持在 **macOS / Linux 环境中的 Claude Code CLI** 使用，暂不支持 Windows、Claude 网页版或移动端。
+
 ```
  你 ──── /crew 面板 · crew 终端面板 ─────────┐
                                             │ 看 · 插话 · 回答 · 验收 · 暂停/取消
@@ -20,6 +23,7 @@
 - **托管工作流**：写法同 Claude Code 的 Workflow 脚本，每个 `agent()` 是一个工人；中断后按 journal 从断点续跑。
 - **能中途干预**：在 Claude 里、`/crew` 面板或终端里都能插话、回答提问、暂停、取消、重试。
 - **故障会上报**：数据源或 MCP 坏了（5xx、连不上、鉴权或额度错误），crew 识别出来并叫醒受影响的对话，不会把"服务坏了"当成"没有数据"。
+- **Claude 对话间沟通，十分有助于上下文管理**：多个 Claude Code CLI 对话可以通过 `message` 工具互发阶段结论、任务进展、文件路径和待办，只传递必要信息，减少在不同任务间重复粘贴背景，节省上下文，更好打通并行任务。
 
 ## 依赖
 
@@ -95,6 +99,20 @@ Claude 的工具：
 
 **结果不串对话**：每个任务记着是哪个对话派的。叫醒只发给那个对话，别的对话不能操作它的任务。
 
+### Claude 对话间沟通
+
+不同任务可以分别放在多个 Claude Code CLI 对话中，通过 `message` 工具把阶段结论、当前进度、待办、问题或文件路径发给本机另一个开着的对话。这样不必重复携带各任务的完整历史，只把当前需要的信息送入目标对话，十分有助于上下文管理，也能把并行推进的工作连接起来。
+
+跨会话通信的底层能力由 **Claude Code 原生提供**：在支持的版本中，Claude 可以列出本机开着的其他对话并给它们发消息，消息通过本机 socket 投递。crew 的 `message` 通过插件接口 `$.session.send` 使用同一套机制，并增加了：
+
+- 按对话标题里的关键词寻找收件人；
+- `to: crew` 一次发给近 3 天使用过 crew 的对话；
+- 把发送记录保存在 `~/.crew/messages.jsonl`，配合 `crew peers` 和 `crew msgs` 清楚查看本机对话和具体通信内容。
+
+因此，虽然 Claude Code 本身已有通信功能，crew 仍保留 `message`，让通信内容更清晰、可查。该功能依赖 Claude Code 版本：如果当前版本没有原生跨会话通信能力，`message` 及发现、联系其他对话的功能可能不可用，具体最低版本尚未确认。
+
+消息只在本机开着的 Claude 会话之间传递，不会发到外部，也不会自动共享完整对话历史；对方会明确看到消息来自另一个 Claude 会话，而不是用户本人输入。每个任务的状态和验收仍归原对话管理。
+
 ## 在终端里用
 
 ```bash
@@ -116,6 +134,8 @@ crew parallel gpt 2                   # 单个档案（同名额组的档案一�
 crew parallel wf 3                    # 工作流里同时跑的 agent() 默认上限
 crew effort ds low                    # 改档案的默认思考档位
 crew hours gpt 09:30-01:00            # 档案的可用时段（UTC），off 取消
+crew peers                            # 列出本机开着的 Claude 对话
+crew msgs                             # 查看最近的跨对话消息记录
 crew alerts                           # 故障告警
 ```
 

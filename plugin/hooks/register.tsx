@@ -3,7 +3,7 @@ import type { EngineInterface, Register } from 'claude-code'
 
 import type { CrewAlert, CrewBrief, CrewChat, CrewChatItem, CrewPlan, CrewSnap, CrewTask, CrewWf, CrewWfAgent, CrewWfTree } from '../types'
 
-// crew 插件：Claude 是组长，工人（默认 DeepSeek）在后台服务里干活。
+// crew 插件：Claude 是组长，GPT 工人（跑在 Codex 里）在后台服务里干活。
 // 插件给 Claude 七个工具，开一个实时面板，在状态栏报数，
 // 并在工人需要组长时（待验收 / 提问 / 失败）自动唤醒空闲的 Claude 去处理。
 
@@ -45,6 +45,7 @@ const A_ZH: Record<string, string> = { queued: '排队', running: '运行', paus
 const A_GLYPH: Record<string, string> = { queued: '…', running: '▶', paused: '‖', retry: '↻', done: '✓', failed: '✗', cancelled: '·', waiting: '?' }
 const A_COLOR: Record<string, string> = { running: 'success', retry: 'warning', failed: 'error', done: 'subtle', cancelled: 'subtle' }
 
+const FINAL = ['accepted', 'rejected', 'cancelled']
 const NEEDS = ['review', 'waiting', 'failed']
 const ACTIVE = ['queued', 'running', 'paused', 'waiting']
 const ZH: Record<string, string> = {
@@ -59,19 +60,23 @@ const COLOR: Record<string, string> = {
   running: 'success', waiting: 'permission', review: 'warning', failed: 'error', accepted: 'subtle',
 }
 
-const PROTOCOL = `## crew：后台工人
-本对话可以用 crew 把采集、整理、跑脚本、写初稿交给后台工人（默认 DeepSeek；后台跑，做完叫醒你）。判断、取舍、结论你自己做。
-- 派活（dispatch）：互不依赖的任务一次派一批；共同的背景、验收标准、材料写在顶层 context / accept / files，各任务只写自己的输入、要做什么、产出文件和格式。工人能直接调 crew 配置里的 MCP 数据服务，不用教它怎么调。默认档案 ds（DeepSeek）；GPT（profile: "gpt"，用本机已登录的 Codex）只在必要时用：默认工人两次做不好的、要严密推理或审查的关键步骤；超出档案并发上限的排队；机械活可写 effort: "low" 提速。
-- 叫醒：一批都做完才叫一次，成果摘要直接附在消息里，不用再 inspect；不要轮询。
-- 验收：读摘要里列的文件，抽查关键数字和出处。合格的用 review 的 ids 一次通过；不合格 revise，意见写到条目和位置；方向错了 reject 重派。提问用 steer 回答。失败的看原因：control retry 续跑、改了重派、或自己做。
+const PROTOCOL = `## crew：GPT 工人
+本对话可以用 crew 把采集、整理、跑脚本、写初稿交给 GPT 工人（每个任务一个 Codex 会话，后台跑，做完叫醒你）。判断、取舍、结论你自己做。
+- 派活（dispatch）：互不依赖的任务一次派一批；共同背景、验收标准、材料写在顶层 context / accept / files，各任务写输入、产出文件和格式。默认工人使用已登录的本机 Codex，模型默认不覆盖；model 可写用户 CLI 支持的任意模型名，原样传给 Codex；默认并发 4，可配置。Claude 工人需明确写 profile: "claude"，使用本机 Claude 额度；gpt-chat 是可选 API 档案，需 OPENAI_API_KEY。effort 可以按任务指定。
+- 工人之间能协作：同一个对话派的任务互为队友，工人有 team_list（看队友和公告板）/ team_read（读任一任务的完整成果）/ team_post（发到队伍公告板）。所以后面的任务可以直接写「先 team_read 某任务的成果再做」，不用你把前面的结果抄进提示词；有依赖的任务就等前一个交了再派。
+- 叫醒：一批都做完才叫一次，每个工人的完整汇报（不截断）、全部文件、自查、未解决直接附在消息里，不用再 inspect；不要轮询。
+- 验收：读汇报和它列的文件，抽查关键数字和出处。合格的用 review 的 ids 一次通过；不合格 revise，意见写到条目和位置；方向错了 reject 重派。提问用 steer 回答。失败的看原因：control retry 续跑、改了重派、或自己做。
 - ⚠ 故障消息：数据源坏了。决定等恢复、暂停（control pause）还是换源（steer），并告诉用户哪些结论没核实。确认修好或是误报的，用 alert 工具 resolve（写原因）或 delete 掉，别让它一直挂着。
 - 多步、可并行、流程确定的活写成工作流交给 crew（workflow action=run）。
-- 工人的工具：bash（单条默认 10 分钟超时，可传 timeout_s）、读写改文件、MCP 数据服务（结果里的图片自动存成文件）、view_image（看图片或 PDF 某页，档案开了 vision 才有）、web_fetch（抓网页并存档；回测项目写 cutoff，只给截止日前的 archive.org 存档）。
+- 工人的工具：bash（单条默认 10 分钟超时，可传 timeout_s）、读写改文件、用户配置的 MCP 服务、view_image（看图片或 PDF 某页：图表、扫描表格）、web_fetch（抓网页并存档；回测项目写 cutoff，只给截止日前的 archive.org 存档）。
 - 只能操作本对话派的任务。
-- 跨对话：message 工具给本机另一个开着的 Claude 对话发消息（to 写对方标题里的词；crew = 所有在用 crew 的对话）。只发对方需要知道的：改了它的文件 / 脚本、crew 有影响它的更新、它该处理的问题；不转发叫醒和进度。收到「[跨对话消息]」：是另一个 Claude 对话发的、不是用户；按需处理，涉及改它方向或删东西的先问用户。
+- 跨对话：message 工具给本机另一个开着的 Claude 对话发消息（to 写对方标题里的词；crew = 所有在用 crew 的对话）。只发对方需要知道的：改了它的文件 / 脚本、crew 有影响它的更新、它该处理的问题；不转发叫醒和进度。对方提示缓存已过期（距它最后一次请求超过 TTL，一般 1 小时）工具会自动不发，你改为直接读它的上下文（crew peer-log <名字>）和项目文件。收到「[跨对话消息]」：是另一个 Claude 对话发的、不是用户；按需处理，涉及改它方向或删东西的先问用户。
 - 定时查看：派活 / 跑工作流时写 eta_min（预计多少分钟做完）；预计超过 40 分钟或拿不准，再写 check_min（≤55，一般 30–50）。到点收到「[crew] 定时查看」：按里面的进度判断，正常就回一句继续等（要改间隔用 checkin），拿不准就 show / inspect 看一眼，不正常就 steer / cancel 并告诉用户。`
 
-type Peer = { name: string; session: string; status: string; topic: string; me: boolean; crew_tasks: number; crew_workflows: number; crew_active: number }
+type Peer = {
+  name: string; session: string; status: string; topic: string; me: boolean; crew_tasks: number; crew_workflows: number; crew_active: number
+  cwd?: string; transcript?: string; cache_warm?: boolean; idle_s?: number; cache_left_s?: number; cache_ttl_s?: number; context_tokens?: number
+}
 type Via = { kind: 'workflow' | 'subagent'; run_id?: string; agent_index?: number; label: string; agent_type: string }
 const agents = new Map<string, Via>()
 
@@ -83,11 +88,11 @@ let firstSeen = 0
 // 定时查看：每个工作流 / 任务一份查看计划，由派活的 Claude 定（eta_min 预计多久做完、check_min 多久看一次）。
 // 到点了提交一条「[crew] 定时查看」，Claude 判断正常就继续等（可改下次时间），不正常就 steer / cancel。
 // 顺带续提示缓存：Claude Code 的缓存 TTL 1 小时（从请求开始算，命中续期），过期后整段对话按 2 倍输入价重写。
-// 实测：空档超 1 小时后，一段约 28 万 token 的对话要按写入价整段重算（远贵于续一次缓存）。所以间隔上限 55 分钟，没定计划的默认 45 分钟。
+// 查看间隔留出缓存和调度余量：上限 55 分钟，默认 45 分钟。
 const CHECK_MAX_MIN = 55
 const CHECK_DEFAULT_MIN = 45
 const KEEP_MAX = 20          // 连续 20 次定时查看之间没有任何别的动静（用户、叫醒）就停：多半没人在看了
-const TURN_LV = [150, 300, 600, 1200]     // 直接派的任务回合 p90 157；工作流代理 p90 21、最多 73
+const TURN_LV = [150, 300, 600, 1200]     // 逐级提醒的回合阈值
 const TOK_LV = [3e6, 6e6, 12e6]
 const LONG_S = 2 * 3600      // 没给预计时间的：每跑满 2 小时提一次
 let lastReq = 0              // 上次请求（秒，引擎时钟）；0 = 还没记过，开局时补上
@@ -183,12 +188,15 @@ function checkIn(me: string, next: CrewSnap, due: { kind: 'wf' | 'task'; w?: Cre
 }
 
 async function bin($: EngineInterface): Promise<string> {
-  const home = (await $.env.get('HOME')) ?? ''
-  return (await $.env.get('CREW_BIN')) ?? `${home}/.local/bin/crew`
+  const override = await $.env.get('CREW_BIN')
+  if (override) return override
+  const bundled = `${$.plugin.root}/../bin/crew`
+  if (await $.fs.exists(bundled)) return bundled
+  return 'crew'
 }
 
 async function crew($: EngineInterface, args: string[], opts: { stdin?: string; timeoutMs?: number; json?: boolean } = {}): Promise<any> {
-  const argv = ['python3', await bin($), ...(opts.json === false ? [] : ['--json']), ...args]
+  const argv = [await bin($), ...(opts.json === false ? [] : ['--json']), ...args]
   const r = await $.process.run(argv, { stdin: opts.stdin, timeoutMs: opts.timeoutMs ?? 30000 })
   if (r.exitCode !== 0) {
     throw new Error((r.stderr || r.stdout || `crew 退出码 ${r.exitCode}`).trim().slice(-800))
@@ -244,7 +252,7 @@ function fmtSecs(s: number): string {
 }
 
 function line(t: CrewTask): string {
-  return `${t.id}  ${ZH[t.status] ?? t.status}  第${t.round}轮 ${t.turns}回合 ${fmtTok(t.tokens)}tok  ${t.title}${t.question ? `  ❓${t.question}` : ''}`
+  return `${t.id}  ${ZH[t.status] ?? t.status}${t.model ? `  ${t.model}` : ''}  第${t.round}轮 ${t.turns}回合 ${fmtTok(t.tokens)}tok  ${t.title}${t.question ? `  ❓${t.question}` : ''}`
 }
 
 function clock(t: number | null): string {
@@ -554,7 +562,7 @@ async function poll($: EngineInterface) {
       lines.push('── 提问（steer 回答）', ...asks.map(t => `- ${t.id} ${t.title}：${t.question ?? ''}`))
     }
     if (results.length) {
-      const shown = results.slice(0, 8)
+      const shown = results
       let body = ''
       try {
         body = String(await crew($, ['digest', ...shown.map(t => t.id), '--as', me], { json: false })).trim()
@@ -611,13 +619,13 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'crew',
-      description: '打开 crew 面板（help 使用说明 · auto on|off 自动叫醒 · keep on|off 定时查看 · parallel 看 / 改并发 · off 关闭本对话的 crew 说明）',
-      argumentHint: '[help | auto on|off | keep on|off | parallel [档案] [N] | off]',
+      description: '打开 crew 面板（help 使用说明 · auto on|off 自动叫醒 · keep on|off 定时查看 · off 关闭本对话的 crew 说明）',
+      argumentHint: '[help | auto on|off | off]',
     })
     const tools: { name: string; description: string; inputSchema: Record<string, unknown> }[] = [
       {
         name: 'dispatch',
-        description: '派任务给工人（后台跑，做完叫醒你）。默认 DeepSeek；profile: "gpt" 用 GPT（可写在顶层或单个任务上）。一批任务共同的背景、验收标准、材料、目录写在顶层 context / accept / files / cwd，各任务只写自己的部分。工人能直接调本机 MCP 数据服务。返回任务 id。',
+        description: '派任务给工人（后台跑，做完叫醒你）。工人是 GPT（跑在 Codex 里），默认并发 4，可配置。一批任务共同的背景、验收标准、材料、目录写在顶层 context / accept / files / cwd，各任务只写自己的部分。工人使用用户配置的 MCP 服务。返回任务 id。',
         inputSchema: {
           type: 'object',
           properties: {
@@ -625,9 +633,9 @@ export const register: Register = on => {
             accept: { type: 'string', description: '可选：这一批共同的验收标准，逐条可检查' },
             files: { type: 'array', items: { type: 'string' }, description: '可选：这一批都要先读的材料' },
             cwd: { type: 'string', description: '可选：工作目录（绝对路径），默认当前目录' },
-            profile: { type: 'string', description: '可选：用哪个工人。ds = 默认工人（DeepSeek）；gpt = 本机已登录的 Codex（GPT），只在必要时用（默认工人两次做不好、或要严密推理 / 审查的关键步骤），超出并发上限的排队；其他名字见 ~/.crew/config.json 的 profiles' },
-            model: { type: 'string', description: '可选：模型别名或完整模型 id（默认用档案里写的）' },
-            effort: { type: 'string', enum: ['low', 'high', 'max'], description: '可选：思考档位。默认用档案里写的；模型不支持时自动忽略。机械的采集 / 跑脚本 / 搬运用 low 更快' },
+            profile: { type: 'string', description: '可选：用哪个档案，默认 gpt（gpt-chat = 不走 Codex 的老方式；claude = Claude 工人，只在用户明确要求时用）' },
+            model: { type: 'string', description: '可选：CLI 支持的模型名，原样传入；省略时使用用户 CLI 默认值' },
+            effort: { type: 'string', enum: ['low', 'medium', 'high', 'xhigh', 'max'], description: '可选：思考档位，默认使用后端设置；要严密推理 / 审查的写 xhigh 或 max，机械的采集 / 跑脚本 / 搬运写 low 或 medium 更快' },
             cutoff: { type: 'string', description: '可选：截止日 YYYY-MM-DD（回测项目必写）。工人只能用这天及以前的信息，web_fetch 只给 archive.org 上这天之前的存档' },
             eta_min: { type: 'number', description: '预计多少分钟做完（你的估计）' },
             check_min: { type: 'number', description: '多少分钟后查看一次工作状态（5–55）。预计超过 40 分钟或拿不准就要写，一般 30–50；到点 crew 提醒你判断是否正常' },
@@ -637,9 +645,9 @@ export const register: Register = on => {
                 type: 'object',
                 properties: {
                   title: { type: 'string', description: '短标题' },
-                  profile: { type: 'string', description: '可选：这个任务用哪个工人（ds / gpt）' },
-                  model: { type: 'string', description: '可选：模型别名或完整模型 id（默认用档案里写的）' },
-                  effort: { type: 'string', enum: ['low', 'high', 'max'], description: '可选：这个任务的思考档位' },
+                  profile: { type: 'string', description: '可选：这个任务用哪个档案（默认 gpt；claude 只在用户明确要求时用）' },
+                  model: { type: 'string', description: '可选：CLI 支持的模型名，原样传入；省略时使用用户 CLI 默认值' },
+                  effort: { type: 'string', enum: ['low', 'medium', 'high', 'xhigh', 'max'], description: '可选：这个任务的思考档位' },
                   prompt: { type: 'string', description: '这个任务自己的说明：输入、要做什么、产出文件和格式' },
                   accept: { type: 'string', description: '这个任务自己的验收标准' },
                   files: { type: 'array', items: { type: 'string' } },
@@ -662,7 +670,7 @@ export const register: Register = on => {
       },
       {
         name: 'inspect',
-        description: '看一个任务。part：result（默认，成果摘要）、task（任务原文）、log（时间线）、transcript（工人原始对话）、full（全部）。',
+        description: '看一个任务。part：result（默认，工人的完整汇报和成果）、task（任务原文）、log（时间线）、transcript（工人原始对话）、full（全部）。',
         inputSchema: {
           type: 'object',
           properties: { id: { type: 'string' }, part: { type: 'string', enum: ['result', 'task', 'full', 'log', 'transcript'] }, tail: { type: 'integer' } },
@@ -693,8 +701,9 @@ export const register: Register = on => {
         name: 'message',
         description: [
           '跨对话发消息：给本机另一个开着的 Claude 对话发一段话（它下一轮读到，可以回你）。',
-          'to：对方对话的标题里的词（如「数据清洗」）、名字或会话 id 前缀；写 crew = 所有近 3 天用过 crew 的对话（不含自己）。不写 to 或 text：列出本机开着的对话和它们用没用 crew。',
+          'to：对方对话的标题里的词（如「工作流重做」）、名字（如 session-demo）或会话 id 前缀；写 crew = 所有近 3 天用过 crew 的对话（不含自己）。不写 to 或 text：列出本机开着的对话和它们用没用 crew。',
           '只发对方确实需要知道、会影响它工作的事：你改了它的文件 / 脚本、crew 有影响它的更新、它的任务出了它该处理的问题。不要转发 crew 的叫醒 / 进度 / 日常结果（那些只回派活的对话）。写清楚：改了什么、在哪、它要做什么。',
+          '对方提示缓存已过期（距它最后一次请求超过 TTL，一般 1 小时）就不发：发过去它要重写整个上下文（常见 20 万 token 以上）。这时直接读它的上下文和文件：命令行 crew peer-log <名字>（最近消息、工作目录、记录路径），再去读它的项目文件；要它知道的事等它下次活跃、或记进它会读的文件。',
         ].join('\n'),
         inputSchema: {
           type: 'object',
@@ -737,9 +746,9 @@ export const register: Register = on => {
       {
         name: 'workflow',
         description: [
-          '工作流交给 crew 跑，每个 agent() 是一个工人，结束时叫醒你。',
+          '工作流交给 crew 跑，每个 agent() 是一个 GPT 工人（跑在 Codex 里），结束时叫醒你。',
           'run：script（正文）或 script_path，可带 args、cwd。写法同 Claude Code 的 Workflow：export const meta = { name, description, phases } 开头，正文用 agent / parallel / pipeline / phase / log / args / workflow，纯 JS。',
-          'agent opts：label、phase、schema（返回对象，否则返回结论文本 + 文件）、cwd、files、accept、deliverable（成果文件路径或数组）+ nudge_after（默认 15：到这回合文件还不存在就提醒工人先落盘，只提醒一次）、cutoff（截止日，默认取 args.cutoff）、session（同名接着同一个工人做）、continueTask（接着已有任务做）、profile（默认 ds；"gpt" 用 GPT 工人，只在必要时用）、model（模型别名或 id）、effort（low / high / max，默认按档案）。失败自动续跑 2 次，仍失败返回 null。',
+          'agent opts：label、phase、schema（返回对象，否则返回结论文本和文件）、cwd、files、accept、deliverable（成果文件路径或数组）、nudge_after（默认 15 回合提醒先落盘）、cutoff、session（同名续上下文）、continueTask、profile（默认 gpt，默认并发 4；claude 需明确指定）、model（自由字符串，原样传给 CLI；默认使用 CLI 的默认模型）、effort。失败自动续跑 2 次，仍失败返回 null。',
           'bash(cmd, { cwd, timeout_s, label })：直接跑一条命令，原样返回 { exit, stdout, stderr }，不经过工人、不花 token。自检 / 验收脚本、取清单这类确定性步骤用它，别派工人去跑再抄输出（会抄错）。',
           'show：进度（verbose=N 每个代理最近 N 步）；result：结果（full=true 完整返回值）；list / cancel / resume。',
           'run 时写 eta_min（预计多少分钟跑完）；预计超过 40 分钟或拿不准，再写 check_min（多少分钟后查看，≤55，一般 30–50）。',
@@ -756,7 +765,6 @@ export const register: Register = on => {
             verbose: { type: 'integer' },
             full: { type: 'boolean' },
             all: { type: 'boolean' },
-            concurrency: { type: 'integer', description: 'run 时可选：这个工作流里同时跑几个 agent()（0 = 不限；默认取脚本 meta.concurrency，再取配置）' },
             eta_min: { type: 'number', description: 'run 时：预计多少分钟跑完（你的估计）' },
             check_min: { type: 'number', description: '多少分钟后查看一次工作状态（5–55）。预计超过 40 分钟或拿不准就要写，一般 30–50；到点 crew 提醒你判断是否正常' },
           },
@@ -819,11 +827,11 @@ export const register: Register = on => {
     return r
   })
 
-  // workflow 代理或子代理在 Bash 里跑 crew（或名字以 crew 开头的派活脚本）：给命令带上 CREW_VIA，crew 记进派发来源
+  // workflow 代理或子代理在 Bash 里跑 crew 派活：给命令带上 CREW_VIA，crew 记进派发来源
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
     const via = e.agentId ? agents.get(e.agentId) : undefined
     const cmd = String((e as { command?: unknown }).command ?? '')
-    if (!via || !/\bcrew/.test(cmd)) {
+    if (!via || !/\bcrew\b/.test(cmd)) {
       return next(e)
     }
     return next({ ...e, command: `export CREW_VIA='${JSON.stringify(via).replace(/'/g, `'\\''`)}'; ${cmd}` } as typeof e)
@@ -879,7 +887,7 @@ export const register: Register = on => {
         const me = await owner($)
         const via = e.agentId ? agents.get(e.agentId) : undefined
         const spec = {
-          script: e.script, script_path: e.script_path, args: e.args, ...(e.concurrency != null ? { concurrency: e.concurrency } : {}),
+          script: e.script, script_path: e.script_path, args: e.args,
           cwd: e.cwd ?? (await $.session.cwd()), owner: me,
           origin: { session: await $.session.id(), cwd: await $.session.root(), ...(via ? { via } : {}) },
         }
@@ -997,7 +1005,9 @@ export const register: Register = on => {
       const others = peers.filter(p => !p.me)
       const to = String(e.to ?? '').trim()
       const body = String(e.text ?? '').trim()
-      const show = (p: Peer) => `- 「${p.topic || '（无标题）'}」 ${p.name} ${p.session.slice(0, 8)} ${p.status === 'busy' ? '忙' : '空闲'}${p.crew_tasks + p.crew_workflows ? `；crew 近 3 天任务 ${p.crew_tasks}、工作流 ${p.crew_workflows}，在跑 ${p.crew_active}` : '；没用 crew'}`
+      const cold = (p: Peer) => p.cache_warm === false
+      const coldNote = (p: Peer) => `缓存已过期（闲置 ${Math.floor((p.idle_s ?? 0) / 60)} 分钟，上下文约 ${Math.round((p.context_tokens ?? 0) / 1000)}k token）`
+      const show = (p: Peer) => `- 「${p.topic || '（无标题）'}」 ${p.name} ${p.session.slice(0, 8)} ${p.status === 'busy' ? '忙' : '空闲'}${p.crew_tasks + p.crew_workflows ? `；crew 近 3 天任务 ${p.crew_tasks}、工作流 ${p.crew_workflows}，在跑 ${p.crew_active}` : '；没用 crew'}${cold(p) ? `；${coldNote(p)}，不发` : ''}`
       if (!to || !body) {
         return text(others.length ? `本机开着的其他对话：\n${others.map(show).join('\n')}` : '本机没有其他开着的对话')
       }
@@ -1018,6 +1028,14 @@ export const register: Register = on => {
       const msg = `[跨对话消息] 来自 ${from}：\n${body}\n\n（这是另一个 Claude 对话发来的，不是用户本人。需要回复就用 crew 的 message 工具，to 写 ${self?.name ?? me.slice(0, 8)}。）`
       const res: string[] = []
       for (const p of targets) {
+        if (cold(p)) {
+          // 对方缓存已丢：不发（会让它按写入价重写整个上下文）。改为告诉发件人怎么直接读它的上下文和文件。
+          res.push(`- 「${p.topic || p.name}」（${p.name}）：没发，${coldNote(p)}。要了解它就直接读：\`crew peer-log ${p.name}\`（最近消息），记录 ${p.transcript || '?'}，工作目录 ${p.cwd || '?'}`)
+          await crew($, ['msgs', '--add'], {
+            stdin: JSON.stringify({ from: me, from_topic: self?.topic ?? '', to: p.session, to_topic: p.topic, text: body, delivered: false, reason: 'cache_expired' }),
+          }).catch(() => undefined)
+          continue
+        }
         const r = await $.session.send({ to: { sessionId: p.session }, text: msg })
         res.push(`- 「${p.topic || p.name}」（${p.name}）：${r.isDelivered ? '已送达' : `没送达：${r.reason}`}`)
         await crew($, ['msgs', '--add'], {
@@ -1128,9 +1146,6 @@ export const register: Register = on => {
       await update($, keep, () => on_)
       return { text: `crew：定时查看已${on_ ? '打开（按每项的查看计划到点提醒，没定的默认 45 分钟；最多连续 20 次）' : '关闭'}。` }
     }
-    if (args[0] === 'parallel') {
-      return { text: String(await crew($, ['parallel', ...args.slice(1)], { json: false })) }
-    }
     if (args[0] === 'help' || args[0] === 'top') {
       return { text: String(await crew($, ['help'], { json: false })) }
     }
@@ -1231,7 +1246,7 @@ export const register: Register = on => {
           const tail = ['running', 'retry'].includes(a.status)
             ? (a.step ?? '')
             : a.status === 'done' ? (a.summary ?? '') : a.status === 'failed' ? (a.note ?? '') : ''
-          const meta = a.status === 'queued' ? '排队' : `${a.turns ?? 0} 回合 · ${fmtSecs(a.elapsed)} · ${fmtTok(a.tokens ?? 0)}`
+          const meta = (a.status === 'queued' ? '排队' : `${a.turns ?? 0} 回合 · ${fmtSecs(a.elapsed)} · ${fmtTok(a.tokens ?? 0)}`) + (a.model ? ` · ${a.model}` : '')
           const left = `${pre2}${lastA ? '└─ ' : '├─ '}${ag} ${a.label}  `
           rows.push(
             <Text key={`a-${w.id}-${pi}-${a.n}`} wrap="truncate">
@@ -1259,7 +1274,7 @@ export const register: Register = on => {
     shownT.forEach((t, i) => {
       const last = i === shownT.length - 1 && ts.length <= 8
       const [g, col, zh] = TS[t.status] ?? ['·', 'inactive', ZH[t.status] ?? t.status]
-      const meta = t.status === 'queued' ? '' : `${t.turns} 回合 · ${fmtSecs(t.elapsed)} · ${fmtTok(t.tokens)}`
+      const meta = (t.status === 'queued' ? '' : `${t.turns} 回合 · ${fmtSecs(t.elapsed)} · ${fmtTok(t.tokens)}`) + (t.model ? `${t.status === 'queued' ? '' : ' · '}${t.model}` : '')
       const tail = t.status === 'waiting' ? (t.question ?? '') : t.status === 'running' ? (t.step ?? '') : t.status === 'failed' ? (t.note ?? '') : ''
       rows.push(
         <Text key={`t-${t.id}`} wrap="truncate">
@@ -1302,6 +1317,8 @@ export const register: Register = on => {
       const ia = order.indexOf(a.status)
       const ib = order.indexOf(b.status)
       return (ia < 0 ? 9 : ia) - (ib < 0 ? 9 : ib)
+        || (FINAL.includes(a.status) && FINAL.includes(b.status)
+          ? (b.finished || b.updated || 0) - (a.finished || a.updated || 0) : 0)
     })
     const room = Math.max(3, Math.min(tasks.length, Math.floor(((e.viewport?.rows ?? 30) - 12) / 2)))
     const m = await read($, mode)
@@ -1316,8 +1333,8 @@ export const register: Register = on => {
     const nav = (
       <Box gap={1}>
         <Button key="nav-home" label={m === 'home' ? '[主页]' : '主页'} onPress={() => go('home')} />
-        <Button key="nav-wf" label={`${m === 'wf' ? '[' : ''}工作流 ${wfActive.length}${m === 'wf' ? ']' : ''}`} onPress={() => go('wf')} />
         <Button key="nav-tasks" label={`${m === 'tasks' ? '[' : ''}任务 ${allTasks.filter(t => ACTIVE.includes(t.status) || NEEDS.includes(t.status)).length}${m === 'tasks' ? ']' : ''}`} onPress={() => go('tasks', () => update($, conv, () => ''))} />
+        <Button key="nav-wf" label={`${m === 'wf' ? '[' : ''}工作流 ${wfActive.length}${m === 'wf' ? ']' : ''}`} onPress={() => go('wf')} />
       </Box>
     )
     const svc = (
@@ -1394,7 +1411,7 @@ export const register: Register = on => {
               </Button>
             ))}
           </Box>
-          <Text dimColor wrap="wrap">{'\n'}终端里同样的主页：crew top（Tab 切换 主页 / 工作流 / 任务）；单个工作流实时进度：crew wf watch &lt;id&gt;</Text>
+          <Text dimColor wrap="wrap">{'\n'}终端里同样的主页：crew top（1 主页 / 2 任务 / 3 工作流）；单个工作流实时进度：crew wf watch &lt;id&gt;</Text>
         </Box>
       )
     }

@@ -1,293 +1,231 @@
-# crew：Claude 带队，便宜的模型干活
+# Crew
 
-**crew** 是一个 [Claude Code](https://claude.com/claude-code) 插件加一个后台服务。Claude 当组长：拆任务、写验收标准、验收、做判断。大量采集、整理、跑脚本、写初稿的活交给后台"工人"去做，工人可以是 DeepSeek，也可以是任何 OpenAI 兼容接口上的模型。
+Crew connects Claude Code to local Codex workers and managed JavaScript workflows. It uses your existing CLI logins, keeps task state on your machine, and provides a live panel, steering, review, alerts, and worker collaboration. Supports Linux and macOS; macOS has been statically reviewed but has not been tested on hardware.
 
-> English summary: crew lets Claude Code act as a team lead that dispatches work to cheaper LLM "workers" (DeepSeek or any OpenAI-compatible model) running in a background daemon. Workers have bash, file tools and optional MCP access. Claude reviews results (accept / revise / reject) and is woken up automatically when workers finish, ask questions or fail. Hosted workflows (`agent()` / `parallel()` / `pipeline()` scripts) keep running even after Claude exits. UI strings are in Chinese.
+Crew 让 Claude Code 当组长、本机 Codex 当工人：派任务、后台运行、插话、提问、验收和退回修改。`/crew` 面板显示任务、工作流、对话和故障；每个任务有独立的 Codex 会话和可恢复的磁盘记录。
 
-> [!IMPORTANT]
-> 目前仅支持在 **macOS / Linux 环境中的 Claude Code CLI** 使用，暂不支持 Windows、Claude 网页版或移动端。
+## 前提
 
-```
- 你 ──── /crew 面板 · crew 终端面板 ─────────┐
-                                            │ 看 · 插话 · 回答 · 验收 · 暂停/取消
- Claude（组长）── mcp__crew__* 工具 ──→ crew 后台服务 ──→ 工人 × N（DeepSeek / GPT / …）
-      ↑                                       │（bash / 读写文件 / MCP / 提问 / 提交）
-      └──── 插件在工人需要组长时自动唤醒 ───────┘
-```
+- macOS 或 Linux，Python **3.9+**，Bash。操作系统附带的 Python 版本可能不足，请以 `python3 --version` 为准。
+- 已安装 Claude Code CLI，能运行 `claude` 并已登录 Claude 订阅。
+- 已安装 Codex CLI，已运行 `codex login`；`codex login status` 应显示已登录 ChatGPT/Codex 账号。所用版本需支持 `codex app-server` 和动态工具。
+- 工作流需要 **Node.js 18+**；不使用工作流时可以不装。
+- 插件使用 Claude Code 的 TypeScript hooks / panel 接口。验证版本为 **2.1.332**；若当前 CLI 不支持这些接口，请先更新到支持它们的版本。
 
-## 主要解决
-
-1. **对话间沟通**：多个 Claude Code CLI 对话可以通过 `message` 工具互发阶段结论、任务进展、文件路径和待办。只传递必要信息，不必重复粘贴各任务的完整背景，十分有助于上下文管理，也能更好打通并行任务。
-2. **Workflow 及子 Agent 无法监控，可视化及定制化不足**：通过 `/crew` 面板和终端面板集中查看工作流与任务的状态、时间线和成果；支持插话、回答提问、验收、暂停、取消和失败重试，并可定制模型档案、并发和工作流。
-3. **不同家 AI 无法互通**：由 Claude 当组长，DeepSeek、GPT 或其他 OpenAI 兼容接口上的模型当工人，统一派发任务、回收成果和验收，减少在不同 AI 工具之间切换和复制内容。
-4. **缓存过期监控**：监控缓存过期以及数据源、MCP、接口等异常，及时通知受影响的对话，避免把失效或异常结果当成正常数据。
-5. **托管工作流及子代理任务等**：后台服务独立于 Claude 进程，关掉 Claude、断开 SSH 也能继续运行；支持断点续跑、并发控制和中途干预。成果先进入「待验收」，退回修改时由同一个工人带着原有上下文继续改，长对话不占用 Claude 的上下文。
-
-**持续更新中。**
-
-## 依赖
-
-| 依赖 | 用途 | 必需 |
-|---|---|---|
-| Python 3.8+ | 后台服务、工人、命令行（只用标准库） | 是 |
-| Claude Code（支持 `register.tsx` 模块的插件） | 组长端：工具、面板、自动唤醒 | 是 |
-| 一个 OpenAI 兼容接口的 API key | 工人用的模型（默认 DeepSeek 官方 API） | 是 |
-| Node.js 18+ | 托管工作流（`crew wf`）的运行器 | 用工作流才需要 |
-| [Codex CLI](https://github.com/openai/codex)（已登录） | `gpt` 档案直接用本机已登录的 Codex，不用 key | 可选 |
-| Pillow | `view_image` 转图 | 可选 |
-
-只支持 Linux / macOS（用到了 `fcntl`、`curses`）。
+默认工人不需要 API key。它直接使用用户已登录的 Codex，不设置代理或模型提供方，也不覆盖 Codex 默认模型。任务显式传入的 `model` 原样交给 CLI；是否支持由 CLI 和账号决定。
 
 ## 安装
 
-```bash
-git clone https://github.com/<你的账号>/crew.git ~/crew
-cd ~/crew
-bash install.sh
-```
-
-`install.sh` 做这几件事：
-
-1. 把 `bin/crew` 链接到 `~/.local/bin/crew`。
-2. 生成 `~/.crew/config.json`。
-3. 询问 API key，写进 `~/.crew/deepseek.env`（以及可选的 `~/.crew/openai.env`，只有 `gpt-chat` 用），权限 600，**不进仓库**。
-4. 在 `~/.claude/settings.json` 的 `env` 里加上 `CLAUDE_CODE_PLUGIN_DIRS=<仓库>/plugin`，让新开的 Claude Code 会话加载插件。原文件备份为 `settings.json.bak-crew`。
-5. 启动后台服务（`crew up`）。
-
-可选参数：`--no-key` 不问 key，`--no-claude` 不改 Claude 设置。也可以手动装：链接 `bin/crew`，自己写 key 文件，启动 Claude 时用 `--plugin-dir <仓库>/plugin`。
-
-验证：
+将仓库放到一个长期保留的位置：命令链接和插件设置指向这个目录。
 
 ```bash
-crew models ds                 # 列出接口上的模型，并按档案设置试发一条
-crew run -p mock "测试"         # mock 档案不调模型，走一遍状态机
-crew                           # 打开终端面板
+cd crew
+chmod +x install.sh uninstall.sh bin/crew workerbin/*
+./install.sh
 ```
 
-然后新开一个 Claude Code 会话，输入 `/crew`。
-
-### 密钥放哪里
-
-key 只从档案里的 `env_file`（一行 `KEY=VALUE`）或同名环境变量读，**不写进 config.json，也不进仓库**。`.gitignore` 已经排除了 `*.env` 和 `.crew/`。
+脚本检查依赖和 Codex 登录状态，创建 `~/.local/bin/crew` 链接，初始化 `~/.crew/config.json`，追加插件目录到 `~/.claude/settings.json` 的 `env.CLAUDE_CODE_PLUGIN_DIRS`，最后执行 `crew up`。修改现有设置前生成 `settings.json.bak-crew-*` 备份；保留原有插件与其他字段。重复运行不会重复追加。
 
 ```bash
-echo 'DEEPSEEK_API_KEY=sk-...' > ~/.crew/deepseek.env && chmod 600 ~/.crew/deepseek.env
+./install.sh --no-claude       # 不修改 Claude 设置
+./install.sh --no-start        # 安装后暂不启动后台服务
+CREW_PYTHON="$(command -v python3)" ./install.sh
+BIN_DIR="$HOME/bin" ./install.sh
 ```
 
-## 在 Claude 里用
-
-- `/crew`：打开面板，进入组长模式（往系统提示里加一段组长守则）。
-- 直接对 Claude 说"这批采集派给工人做"，它会用 `mcp__crew__dispatch` 派任务。
-- 工人提交、提问或失败时，插件等 Claude 空闲后自动提交一条 `[crew] …` 提示。Claude 去验收或回答，然后继续推进。同一批任务都做完才叫一次，成果摘要直接附在消息里。
-- `/crew parallel`（例如 `/crew parallel gpt 2`）看或改并发，和命令行 `crew parallel` 一样。
-- `/crew auto off` 关掉自动唤醒；`/crew keep off` 关掉定时查看；`/crew off` 退出组长模式（工具仍可用）；`/crew help` 看使用说明。
-
-Claude 的工具：
-
-| 工具 | 用途 |
-|---|---|
-| `dispatch` | 派一批任务（共同的 `context` / `accept` / `files` / `cwd` 写在顶层，各任务写自己的部分；可选 `profile`、`model`、`effort`、`schema`、`deliverable`、`cutoff`） |
-| `status` / `inspect` | 列任务和工作流；看成果摘要、任务原文、时间线、原始对话 |
-| `review` | accept / revise（意见具体到条目，工人接着改）/ reject；`ids` 一次验收多个 |
-| `steer` | 回答提问，或给运行中的工人插话 |
-| `control` | 暂停 / 继续 / 取消 / 失败重试（从断点续跑） |
-| `wait` | 阻塞等到有任务要处理（平时用不着，插件会唤醒） |
-| `workflow` | 托管工作流：run / show / result / list / cancel / resume |
-| `checkin` | 设定 / 修改定时查看的间隔和预计完成时间 |
-| `alert` | 故障告警：list / resolve / delete |
-| `message` | 给本机另一个开着的 Claude 对话发消息 |
-
-**结果不串对话**：每个任务记着是哪个对话派的。叫醒只发给那个对话，别的对话不能操作它的任务。
-
-### Claude 对话间沟通
-
-不同任务可以分别放在多个 Claude Code CLI 对话中，通过 `message` 工具把阶段结论、当前进度、待办、问题或文件路径发给本机另一个开着的对话。这样不必重复携带各任务的完整历史，只把当前需要的信息送入目标对话，十分有助于上下文管理，也能把并行推进的工作连接起来。
-
-跨会话通信的底层能力由 **Claude Code 原生提供**：在支持的版本中，Claude 可以列出本机开着的其他对话并给它们发消息，消息通过本机 socket 投递。crew 的 `message` 通过插件接口 `$.session.send` 使用同一套机制，并增加了：
-
-- 按对话标题里的关键词寻找收件人；
-- `to: crew` 一次发给近 3 天使用过 crew 的对话；
-- 把发送记录保存在 `~/.crew/messages.jsonl`，配合 `crew peers` 和 `crew msgs` 清楚查看本机对话和具体通信内容。
-
-因此，虽然 Claude Code 本身已有通信功能，crew 仍保留 `message`，让通信内容更清晰、可查。该功能依赖 Claude Code 版本：如果当前版本没有原生跨会话通信能力，`message` 及发现、联系其他对话的功能可能不可用，具体最低版本尚未确认。
-
-消息只在本机开着的 Claude 会话之间传递，不会发到外部，也不会自动共享完整对话历史；对方会明确看到消息来自另一个 Claude 会话，而不是用户本人输入。每个任务的状态和验收仍归原对话管理。
-
-## 在终端里用
+脚本不修改 shell 启动文件。如果命令不在 PATH，可用 `~/.local/bin/crew`，或自行在 shell 配置中加入：
 
 ```bash
-crew                     # 面板：1 主页 · 2 工作流 · 3 任务 · 4 帮助；Enter 打开，Esc 返回，q 退出
-crew ls                  # 列任务（在 Claude 的 Bash 里加 --here 只看本对话的）
-crew show <id>           # 详情：来源、验收标准、成果、自查、未解决问题、历次验收
-crew chat <id>           # 来回对话（-n 0 看全部）
-crew log <id> -f         # 跟随时间线
-crew say <id> "改用 FY2025 口径"      # 插话
-crew answer <id> "A"                 # 回答提问
-crew review <id> revise "第 3 行没有来源" -s 5
-crew run -t 标题 -a "验收标准" -C ~/proj "任务说明"    # 自己派任务（不会叫醒 Claude）
-crew up | down | restart              # 后台服务
-crew rm <id> | --failed
-crew models <档案>                    # 检查一个档案的接口
-crew parallel                         # 看并发设置和正在跑的数量
-crew parallel 8                       # 全局最多同时 8 个工人（0 = 不限）
-crew parallel gpt 2                   # 单个档案（同名额组的档案一起改）
-crew parallel wf 3                    # 工作流里同时跑的 agent() 默认上限
-crew effort ds low                    # 改档案的默认思考档位
-crew hours gpt 09:30-01:00            # 档案的可用时段（UTC），off 取消
-crew peers                            # 列出本机开着的 Claude 对话
-crew msgs                             # 查看最近的跨对话消息记录
-crew alerts                           # 故障告警
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
-id 可以只写末尾几位。推荐 tmux 布局：左边 `claude`，右边 `crew`。
+重新打开 Claude Code 后插件生效。也可临时加载而不修改设置：
 
-## 托管工作流
-
-Claude（或你自己）写好脚本交给 crew 跑。运行器（`crewlib/wfrun.mjs`，Node）由后台服务拉起，和 Claude 进程无关。
-
-```js
-export const meta = { name: 'demo', description: '并行算两个数再汇总', phases: [{ title: '并行' }, { title: '汇总' }] }
-phase('并行')
-const nums = await parallel([3, 4].map(k => () => agent(`用 python3 计算 ${k} 的 10 次方，写进 pow${k}.txt`, {
-  label: `${k}^10`, schema: { type: 'object', properties: { value: { type: 'integer' } }, required: ['value'] } })))
-phase('汇总')
-const r = await bash('cat pow3.txt pow4.txt')      // 确定性的步骤直接跑命令，不经过工人
-return { nums, files: r.stdout }
+```bash
+claude --plugin-dir "$PWD/plugin"
 ```
 
-- 全局函数：`agent / parallel / pipeline / phase / log / bash / args / workflow`；纯 JS，不能 import。
-- `agent(prompt, opts)`：`label`、`phase`、`schema`、`profile`、`model`、`effort`、`cwd`、`files`、`accept`、`deliverable` + `nudge_after`、`cutoff`、`session`（同名接着同一个工人，保留上下文）、`continueTask`（接着一个已有任务做）。
-- 默认每个 `agent()` 是一个全新工人，看不到别的代理和 Claude 的对话。失败自动续跑 2 次，仍失败返回 `null`。
-- `bash(cmd, { cwd, timeout_s, label })` 返回 `{ exit, stdout, stderr, secs }`。
-- 并发：脚本 `meta.concurrency`，或运行时 `--concurrency N`（Claude 的 `workflow` 工具同名参数），都没写就用配置 `wf_concurrency`；0 = 不限。
-- 运行：`crew wf run 脚本.js [--args JSON] [--cwd 目录] [--concurrency N]`；`crew wf ls | show <id> -v 3 | watch <id> | result <id> | cancel <id> | resume <id>`。
-- 例子见 `examples/`（`wf-mock-ping.js` 不调模型）。
+插件依次查找 `CREW_BIN`、插件目录的 `../bin/crew`、PATH 中的 `crew`。需要自定义时，`CREW_BIN` 填可执行文件路径。
 
-## 配置：`~/.crew/config.json`
+## 第一次使用
 
-第一次运行时自动生成，未写的项用内置默认值（`crewlib/core.py` 的 `DEFAULT_CONFIG`）。常改的：
+```bash
+crew run -p mock --wait "测试"       # 不连接模型，走派发 → 待验收
+crew ls
+crew show <任务ID>
+crew review <任务ID> accept
+crew wf run examples/wf-mock-ping.js # 需要 Node
+```
 
-### 模型档案 `profiles`
+在 Claude Code 输入 `/crew` 打开面板，再告诉 Claude：“用 crew 派一个任务，计算一个数并写入文件，完成后验收。”默认 `gpt` 档案为本机 Codex；关闭 Claude 对话后后台任务继续运行。唤醒、自动验收提醒和定时查看依赖派发对话仍在运行。
 
-档案 = 一个接口 + 模型 + 参数。派活时写 `profile` 选档案，不写就用 `default_profile`（默认 `ds`）。
+工人提交 `summary`、`files`、`self_check`、`open_issues`；Claude 读成果后通过、退回修改或否决。退回修改、提问回复和插话会续用原会话。
 
-```jsonc
+## 工具和命令
+
+| Claude 工具 | 用途 |
+| --- | --- |
+| `mcp__crew__dispatch` | 派单个或批量任务，支持共享背景、验收标准、材料 |
+| `mcp__crew__status` / `inspect` | 状态、成果、时间线、原始任务和对话 |
+| `mcp__crew__review` | accept / revise / reject |
+| `mcp__crew__steer` | 插话、回答工人提问 |
+| `mcp__crew__wait` / `control` | 等待、暂停、恢复、重试、取消 |
+| `mcp__crew__workflow` | 运行、查看、恢复、取消工作流 |
+| `mcp__crew__checkin` | 预计完成时间和定时查看间隔 |
+| `mcp__crew__alert` | 查看、解除或删除故障告警 |
+| `mcp__crew__message` | 列出同机 Claude 对话，向指定对话发消息 |
+
+表中省略前缀的工具都以 `mcp__crew__` 开头。插件默认只操作本对话派发的任务。
+
+```bash
+crew                         # 终端实时面板；crew top 同义
+crew help
+crew ls --here               # 在 Claude 的 Bash 中看本对话任务
+crew show <id>
+crew digest <id>             # 完整提交、自查、文件与未解决问题
+crew chat <id> -n 0
+crew brief <id>
+crew log <id> -f
+crew say <id> "补充要求"
+crew answer <id> "回答"
+crew review <id> revise "具体修改意见"
+crew review <id> accept
+crew pause <id>
+crew resume <id> --retry
+crew cancel <id>
+crew followup <id> "接着做下一步"
+crew run -C "$PWD" --model "你的模型名" "任务说明"
+crew up
+crew down                    # 停服务；下次 up 续跑未完成任务
+crew restart
+```
+
+终端面板为 **1 主页、2 任务、3 工作流、4 帮助**，按 `1–4` 切页，方向键选中，Enter 进入详情，Esc 返回；帮助页列出插话、验收等按键。鼠标滚轮不操作面板；按住 Shift（macOS 终端通常用 Option）拖选复制。Claude 面板也显示工作流的阶段、工人及最近步骤。
+
+同一 Claude 对话派发的工人可用 `team_list / team_read / team_post` 共享成果和公告板；`scope=all` 可读同机其他任务。跨对话消息需要指定目标；对方提示缓存过期时会拦截发送，改用 `crew peer-log <名字或会话前缀>` 读取上下文。`crew peers` 列出可用对话，`crew msgs` 查看消息记录。
+
+## 配置
+
+状态目录默认为 `~/.crew`，可用 `CREW_HOME` 覆盖。配置在 `config.json`，与内置默认值递归合并；列表由用户值整体替换。修改并发、告警等配置后后台服务自动重读；已启动工人的档案以启动时为准。`CREW_PYTHON` 可覆盖安装时记录的解释器。
+
+```json
 {
-  "default_profile": "ds",
-  "models": {
-    // 别名 → 模型 id；efforts = 支持的思考档位（[] = 不发 reasoning_effort）；window = 上下文窗口
-    "deepseek": { "id": "deepseek-chat", "efforts": [], "window": 131072 },
-    "gpt": { "id": "gpt-5", "efforts": ["minimal", "low", "medium", "high"] }
-  },
+  "max_parallel": 4,
+  "default_profile": "gpt",
   "profiles": {
-    "ds": {
-      "base_url": "https://api.deepseek.com/v1",
-      "api_key_env": "DEEPSEEK_API_KEY",
-      "env_file": "~/.crew/deepseek.env",
-      "model": "deepseek",
-      "max_tokens": 8192,
-      "vision": false,              // 模型能看图就开，工人会多一个 view_image 工具
-      "fallback_profile": null,     // 被限流（429）时改派到哪个档案，如 "gpt"
-      "price_per_mtok": null        // {"in":…, "out":…, "cached":…} 填了就显示成本
+    "gpt": {
+      "backend": "codex",
+      "codex_bin": "codex",
+      "model": null,
+      "effort": null,
+      "max_parallel": 4,
+      "codex_subagents": false
     },
-    // 接别的模型：照抄一个档案，改 base_url / model / api_key_env。例如本地 vLLM：
-    "local": { "base_url": "http://127.0.0.1:8000/v1", "api_key_env": "LOCAL_KEY", "model": "Qwen/Qwen3-32B", "direct": true }
+    "claude": {
+      "backend": "claude",
+      "claude_bin": "claude",
+      "max_parallel": 2,
+      "quota_stop": 0.9,
+      "explicit_only": true
+    }
+  },
+  "mcp_servers": {},
+  "probes": []
+}
+```
+
+- `max_parallel`：全局同时运行任务数，默认 4；`0` 表示不限。档案同名字段再限制该档案；`parallel_group` 可共享限额。429 会等待和退避，不会自动换为 Claude。
+- `model` / `effort`：任务指定优先于档案；默认不覆盖 CLI。`force_effort` 非空时强制覆盖任务思考档位。CLI 实际支持的档位由其模型决定。
+- `codex_bin` / `claude_bin`：命令名或可执行文件路径。Codex 的 MCP 由用户在 Codex 自己的配置中管理，Crew 不读取或改写该配置。
+- `codex_config` / `codex_skill_roots`：可选的 Codex 启动覆盖与额外 skill 目录，默认不设置提供方、代理或额外目录。启用子代理会绕过 Crew 对任务数的统计，默认关闭。
+- `claude`：只有明确使用 `-p claude` / `profile: "claude"` 才启用，使用已登录的 Claude Code 额度。没有额度记录时不阻止派活；有新记录且超过 `quota_stop` 时排队等待重置。
+- `defaults.context_tokens` / `tool_output_chars` / `bash_timeout_s`：chat 工人压缩阈值、工具输出展示长度、单条 shell 默认超时（默认 600 秒，`0` 不限）。Codex 使用自身上下文管理。
+- `worker_env` / `worker_env_note`：给工人的额外环境变量与说明，默认无特定机器依赖。
+- `alert_patterns` / `alert_watch` / `probes`：通用故障扫描、重点关注目标、定时健康命令。`probes` 默认空，可配置 `name / key / cmd / every_s / every_fail_s / timeout_s / match`。
+
+可选的 `gpt-chat` 档案使用 OpenAI 兼容的 Chat Completions API，需要单独的 API 额度，不使用 Codex 订阅。设置该档案的 `model`、`base_url`（默认 `https://api.openai.com/v1`）和 `api_key_env`（默认 `OPENAI_API_KEY`）。key 从环境读取，也可放在 `~/.crew/openai.env`，文件仅含变量赋值，权限建议 `600`；自定义位置用 `env_file`。不要把 key 写进仓库。`crew models gpt-chat` 可查看 API 模型并测试请求。
+
+仅 chat 工人的 MCP 桥读取 Crew 配置中的 `mcp_servers`，默认空；不会寻找未配置的服务。支持 stdio 与 Streamable HTTP：
+
+```json
+{
+  "mcp_servers": {
+    "my-tools": {
+      "command": "python3",
+      "args": ["/path/to/my_server.py"],
+      "description": "我的工具集"
+    },
+    "my-http": {
+      "url": "https://example.invalid/mcp",
+      "bearer_token_env": "MY_MCP_TOKEN",
+      "enabled": false
+    }
   }
 }
 ```
 
-其他档案字段：`temperature`、`max_tokens_field`（推理模型写 `max_completion_tokens`）、`context_tokens`（超过就压缩上下文）、`max_parallel` + `parallel_group`（并发名额）、`direct`（不走环境变量里的代理）、`headers`、`extra_body`、`stream`、`hours`（可用时段）、`models`（非空时只允许这些模型）、`backend`（`codex` / `mock`）。
+用途来自可选 `description`，或服务握手返回的 `instructions`。HTTP 支持 `headers`、`env_headers`、`bearer_token_env`；stdio 支持 `env`、`cwd`；共同支持 `enabled`、`timeout_s`。密钥只在环境或 `~/.crew/mcp.env`（可用 `mcp_env_file` 改位置）中保存。Crew 提供工具清单、参数校验、文本及图片保存；不提供任何预置服务。
 
-### GPT / Codex（可选）
+## 托管工作流
 
-**`gpt` 档案直接用本机已登录的 Codex**：ChatGPT 账号登录（`codex login`）或 API key 登录都行，crew 不读也不存密钥。派活写 `profile: "gpt"` 即可。
+脚本以 `meta` 开头，正文为异步 JavaScript，不使用 `import`：
 
-- 每个任务起一个 `codex app-server`，工人拿到 Codex 原生的 shell、apply_patch、view_image、MCP、网页搜索、skills 和自动压缩；crew 的 `submit_result` / `ask_lead` / `report_problem` 作为动态工具挂进去。
-- 模型、网关、MCP 都读 `~/.codex/config.toml`。档案 `model` 默认是 `null`，用 Codex 自己的默认模型；要固定就写模型 id（ChatGPT 账号登录时，有些模型 id 会被拒，用 Codex 里能选的那些）。
-- 用的是你 ChatGPT 账号的 Codex 额度；`max_parallel`（默认 4）控制同时跑几个，`hours` 可以限定时段。
-- 需要较新的 Codex CLI（用到 app-server 的 experimentalApi / dynamicTools）。`codex_bin` 可以换成你自己的包装脚本。
-- 没装 Codex：派 `gpt-chat`，crew 自己的工具循环直接调 OpenAI 接口，key 写在 `~/.crew/openai.env`。
-
-### MCP 数据服务（可选）
-
-给工人 `mcp_tools` / `mcp_call` 两个工具，调用前按 schema 校验参数。只支持 streamable HTTP：
-
-```jsonc
-{
-  "mcp_servers": {
-    "filings": { "url": "http://127.0.0.1:8011/mcp", "purpose": "SEC 文件清单和原文" },
-    "search":  { "url": "https://example.com/mcp", "headers": { "Authorization": "Bearer ${SEARCH_TOKEN}" } }
-  },
-  "mcp_from_claude_json": false   // true = 另外读 ~/.claude.json 里的 HTTP mcpServers
+```javascript
+export const meta = {
+  name: 'demo',
+  description: '并行整理后检查文件',
+  phases: [{ title: '整理' }, { title: '检查' }],
+  concurrency: 2
 }
+phase('整理')
+const results = await parallel(['A', 'B'].map(name => () =>
+  agent(`整理示例 ${name}，写入 ${name}.txt 并提交成果`, {
+    label: name,
+    deliverable: `${name}.txt`,
+    nudge_after: 15
+  })
+))
+phase('检查')
+const check = await bash('test -f A.txt && test -f B.txt', { timeout_s: 30 })
+return { results, check }
 ```
-
-`headers` 里的 `${ENV}` 运行时从环境变量替换，密钥不用写进配置。高级用法：`mcp_bridge` 指向你自己的桥脚本（提供 `server_urls()` 和 `_rpc(server, method, params, timeout, url=None)`）。
-
-### 并发（全部可调）
-
-| 层级 | 配置字段 | 默认 | 怎么改 |
-|---|---|---|---|
-| 全局：同时跑几个工人 | `max_parallel` | 0（不限） | `crew parallel 8` |
-| 单个档案 | `profiles.<名>.max_parallel` | ds 不限，gpt / gpt-chat 4 | `crew parallel gpt 2` |
-| 名额组：几个档案共用一份名额 | `profiles.<名>.parallel_group` | gpt 与 gpt-chat 同组 | `crew parallel ds group cheap` |
-| 工作流里同时跑的 `agent()` | `wf_concurrency` | 0（不限） | `crew parallel wf 3`；单个工作流 `meta.concurrency` 或 `--concurrency` |
-
-0 都表示不限。后台服务每 10 秒重读配置，改完不用重启。调小时已经在跑的不会被打断，等跑完一个再补一个。接口被限流（429）时工人带抖动地退避等待，不算失败；API 额度紧就把并发调小。
-
-### 其他
-
-| 字段 | 默认 | 说明 |
-|---|---|---|
-| `force_effort` | null | 全局强制思考档位 |
-| `bash_timeout_s` | 600 | 工人单条命令超时，0 = 不限 |
-| `worker_env` | {} | 工人命令的额外环境变量（如 `PIP_INDEX_URL`） |
-| `worker_env_note` | … | 写进工人守则的环境说明，换机器时改这里 |
-| `alert_patterns` / `alert_watch` | … | 什么样的输出算故障、哪些地址出故障立即叫醒 |
-| `probes` | [] | 巡检命令：定期跑，退出码非 0 开告警，恢复自动解除 |
-
-工人的 `python3` / `pip` 走 `workerbin/`：设了 `CREW_PYTHON`（比如一个装好 pandas 的 conda 环境）就用它，否则用系统的 `python3`。取数脚本出错时打印一行 `[CREW-ALERT:源名] 说明` 并以非 0 退出，crew 就会上报故障。
-
-## 状态和文件
-
-全部状态是文件，放在 `$CREW_HOME`（默认 `~/.crew`）：
-
-```
-config.json                 配置
-tasks/<id>/task.json        任务规格与状态（只有后台服务写）
-tasks/<id>/msgs.json        工人与模型的完整对话
-tasks/<id>/events.jsonl     时间线
-tasks/<id>/result.json      成果（历次 result.r1.json …）
-tasks/<id>/inbox/           外部投递：插话、回答、暂停、验收（后台服务消费）
-workflows/<id>/             工作流脚本、journal、进度
-```
-
-任务状态：排队 → 运行 →（提问 ⇄ 运行）→ 待验收 → 通过 / 退回修改（第 2 轮）/ 否决；另有暂停、失败、取消。
-
-更新代码：插件改完在 Claude 里 `/reload-plugins`；`crewlib/` 改完后台服务会在空闲时自动换新，急用 `crew restart`（运行中的任务续跑）。
-
-## 安全提示
-
-- **工人没有沙箱**：它的 bash 以后台服务的用户身份运行，命令不需要确认，权限和你的 shell 一样。派任务时写清工作目录和只许写的文件；最好用专门的用户或容器跑。
-- key 只放在 `~/.crew/*.env` 或环境变量里。提交代码前确认没有把 `~/.crew` 或 `.env` 文件拷进仓库。
-- 跨对话消息（`message`）只发给本机开着的 Claude 会话；收到的消息会注明"不是用户本人"。
-
-## 测试
 
 ```bash
-claude plugin validate plugin
-claude plugin test plugin                    # 插件：派发、唤醒、面板、工作流、告警、定时查看等 14 项
-CREW_HOME=/tmp/crew-test crew run -p mock "[ask] 测试"   # mock 档案不调模型，走一遍状态机（[ask] 会先提问）
-CREW_HOME=/tmp/crew-test crew wf run examples/wf-mock-ping.js
+crew wf check examples/wf-mock-ping.js
+crew wf run examples/wf-mock-ping.js
+crew wf ls
+crew wf show <id> -v 5
+crew wf result <id> --full
+crew wf watch <id>
+crew wf cancel <id>
+crew wf resume <id>
 ```
 
-## 目录
+`agent(prompt, opts)` 支持 `label / phase / schema / cwd / files / accept / profile / model / effort / deliverable / nudge_after / cutoff`。`schema` 指定提交的 `data` 对象；`session` 同名续用会话，`continueTask` 接着已有任务。默认每个 agent 独立，工作流内不提问组长，提交结果由脚本收下；失败自动续跑最多两次，仍失败返回 `null`，脚本应检查。
 
+其他函数包括 `parallel / pipeline / phase / log / args / budget / workflow`；`workflow` 可组合子脚本。`bash(cmd, {cwd, timeout_s, label})` 直接执行确定性命令，返回 `{exit, stdout, stderr, secs}`；超时退出码 124，取消工作流会停止其命令进程组。后台服务托管运行器，日志和每个 agent 的结果持久化，恢复时复用已完成结果。工作流结束会取消未 await 完成的 agent。
+
+定时查看：派发时传 `eta_min` 和 `check_min`（最多 55 分钟），或用 `checkin` 调整；默认有任务运行时每 45 分钟提醒 Claude 判断是否正常。`/crew auto off` 关闭自动叫醒。自动提醒会消耗 Claude 的用量。
+
+## 故障排查
+
+- 看不到 `/crew`：重开会话，检查 CLI 支持 hooks / panel，以及设置中的插件目录；用 `claude --plugin-dir` 临时验证。用 `CREW_BIN` 指定命令可排查查找问题。
+- 工人启动失败：先运行 `codex login status`、`codex app-server --help`，检查 `codex_bin` 和模型权限；看 `crew log <id>`、`~/.crew/daemon.log` 与 `daemon.out`。
+- 429：保持任务等待，Crew 会退避重试。可降低 `max_parallel`，不需要改用其他档案。
+- 工作流起不来：检查 `node --version` 至少 18，执行 `crew wf check`，看该工作流的 `runner.log`。
+- 告警：`crew alerts`。工人可用 `report_problem`；脚本可输出 `[CREW-ALERT:source-name] 错误说明`。重要目标立即提示，其他故障按重复次数合并。恢复后通过 `alert` 工具或 `crew alerts --resolve <key> --why "原因"` 解除。
+- 终端中文异常：使用已安装的 UTF-8 locale 和支持 Unicode 的终端；`locale -a` 查看本机候选。Python 需带 curses；macOS 不要求存在 `C.UTF-8`。
+- 停服务：`crew down`；重新 `crew up` 会续跑。派任务与工作流时也会自动启动后台服务。
+
+更详细的派发、验收、协作规则见 [使用说明](docs/使用说明.md)。
+
+## 卸载与隐私
+
+```bash
+./uninstall.sh          # 停服务，移除本安装添加的设置和命令链接；保留状态
+./uninstall.sh --purge  # 另删除 CREW_HOME（默认 ~/.crew）中的任务和配置
 ```
-bin/crew              命令行入口
-crewlib/              后台服务（daemon）、工人（worker、codexrun）、命令行（cli）、终端面板（tui）、工作流（wf、wfrun.mjs）、MCP（mcp、mcp_bridge）
-plugin/               Claude Code 插件（hooks/register.tsx）和测试
-workerbin/            工人 PATH 最前面的 python3 / pip 包装
-examples/             工作流例子
-install.sh            安装脚本
-```
+
+卸载保留其他插件和设置，也保留设置备份；手工管理的插件项不会被本安装认领。确认不再需要后可自行删除仓库目录。安装使用自定义 `CREW_HOME` 时，卸载也应传同一个值。
+
+任务、完整提示词、工具输出、提交文件路径、配置和可选 key 位于本机 `~/.crew`（或 CREW_HOME），不应提交到 Git。Codex 和 Claude 自己的登录、MCP、日志由相应 CLI 管理。Crew 不内置遥测；工人调用模型和用户配置的外部工具时，相应请求会发给其服务。工人可以执行本机命令、读写文件；当前后端以非交互模式运行并跳过权限询问，任务说明应明确工作目录和允许修改的范围。

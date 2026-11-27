@@ -1,15 +1,19 @@
 __pycache__/
-*.pyc
-# Claude Code 生成的插件类型
-plugin/.claude-plugin/types/
-# 密钥和本地状态永远不进仓库
-*.env
-.env*
-.crew/
-# 本机 Claude / MCP 配置与消息记录可能包含公司资产
-.mcp.json
-.claude.json
-.claude/
-*.sock
-messages.jsonl
+*.py[cod]
+.venv/
 node_modules/
+plugin/.claude-plugin/types/
+.DS_Store
+.env
+.env.*
+*.log
+打包记录.md
+.crew/
+.codex/
+.claude/
+.claude.json
+.mcp.json
+messages.jsonl
+*.sock
+*.env
+.secrets.baseline

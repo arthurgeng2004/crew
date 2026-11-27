@@ -1,8 +1,18 @@
 # Crew
 
-Crew connects Claude Code to local Codex workers and managed JavaScript workflows. It uses your existing CLI logins, keeps task state on your machine, and provides a live panel, steering, review, alerts, and worker collaboration. Supports Linux and macOS; macOS has been statically reviewed but has not been tested on hardware.
+Crew connects Claude Code with local Codex and Claude subagents plus managed JavaScript workflows. It uses existing CLI logins, keeps task state on your machine, and provides live workflow and content visibility, steering, review, cross-conversation messaging, cache-expiry handling, alerts, and subagent collaboration. Supports Linux and macOS; macOS has been statically reviewed but has not been tested on hardware.
 
-Crew 让 Claude Code 当组长、本机 Codex 当工人：派任务、后台运行、插话、提问、验收和退回修改。`/crew` 面板显示任务、工作流、对话和故障；每个任务有独立的 Codex 会话和可恢复的磁盘记录。
+Crew 让 Claude Code 当组长，本机 **Codex 和 Claude 都能作为子代理**：统一派任务、后台运行、插话、提问、验收和退回修改。`/crew` 面板集中显示任务、工作流、执行流程、对话内容和故障；每个任务有独立会话和可恢复的磁盘记录，把组长、子代理、工作流和消息沟通全端打通。
+
+## 主要解决
+
+1. **对话间沟通**：多个 Claude Code 对话可以通过 `message` 互发阶段结论、进展、文件路径和待办，只传必要信息，减少重复背景，节省上下文；`crew peers` 和 `crew msgs` 让本机对话与具体通信内容清晰可查。
+2. **Workflow 及子 Agent 无法监控，流程、内容可视化及定制化不足**：`/crew` 面板集中展示工作流阶段、子代理、最近步骤、时间线、原始任务、对话和成果；支持插话、提问、验收、暂停、恢复、重试和取消，并可定制模型档案、并发与工作流。
+3. **不同家 AI 无法互通**：Codex 和 Claude 都能作为子代理，由 Claude Code 统一调度，保留各自 CLI 登录和模型能力；子代理之间可共享成果、公告板和消息，不必在不同 AI 工具之间反复切换、复制内容。
+4. **缓存过期监控**：监控跨对话缓存状态，对方缓存过期时会拦截发送，改用 `crew peer-log <名字或会话前缀>` 读取上下文，避免消息悄悄断链或基于过期信息继续协作。
+5. **托管工作流及子代理任务等**：后台服务托管 JavaScript 工作流和子代理任务，关闭 Claude 对话后仍可继续运行；支持磁盘持久化、断点续跑、结果复用、定时查看、失败重试和验收回路。
+
+**持续更新中。**
 
 ## 前提
 
@@ -12,7 +22,7 @@ Crew 让 Claude Code 当组长、本机 Codex 当工人：派任务、后台运�
 - 工作流需要 **Node.js 18+**；不使用工作流时可以不装。
 - 插件使用 Claude Code 的 TypeScript hooks / panel 接口。验证版本为 **2.1.332**；若当前 CLI 不支持这些接口，请先更新到支持它们的版本。
 
-默认工人不需要 API key。它直接使用用户已登录的 Codex，不设置代理或模型提供方，也不覆盖 Codex 默认模型。任务显式传入的 `model` 原样交给 CLI；是否支持由 CLI 和账号决定。
+默认子代理不需要 API key。它直接使用用户已登录的 Codex，不设置代理或模型提供方，也不覆盖 Codex 默认模型。任务显式传入的 `model` 原样交给 CLI；是否支持由 CLI 和账号决定。
 
 ## 安装
 
@@ -59,7 +69,7 @@ crew wf run examples/wf-mock-ping.js # 需要 Node
 
 在 Claude Code 输入 `/crew` 打开面板，再告诉 Claude：“用 crew 派一个任务，计算一个数并写入文件，完成后验收。”默认 `gpt` 档案为本机 Codex；关闭 Claude 对话后后台任务继续运行。唤醒、自动验收提醒和定时查看依赖派发对话仍在运行。
 
-工人提交 `summary`、`files`、`self_check`、`open_issues`；Claude 读成果后通过、退回修改或否决。退回修改、提问回复和插话会续用原会话。
+子代理提交 `summary`、`files`、`self_check`、`open_issues`；Claude 读成果后通过、退回修改或否决。退回修改、提问回复和插话会续用原会话。
 
 ## 工具和命令
 
@@ -68,7 +78,7 @@ crew wf run examples/wf-mock-ping.js # 需要 Node
 | `mcp__crew__dispatch` | 派单个或批量任务，支持共享背景、验收标准、材料 |
 | `mcp__crew__status` / `inspect` | 状态、成果、时间线、原始任务和对话 |
 | `mcp__crew__review` | accept / revise / reject |
-| `mcp__crew__steer` | 插话、回答工人提问 |
+| `mcp__crew__steer` | 插话、回答子代理提问 |
 | `mcp__crew__wait` / `control` | 等待、暂停、恢复、重试、取消 |
 | `mcp__crew__workflow` | 运行、查看、恢复、取消工作流 |
 | `mcp__crew__checkin` | 预计完成时间和定时查看间隔 |
@@ -100,13 +110,13 @@ crew down                    # 停服务；下次 up 续跑未完成任务
 crew restart
 ```
 
-终端面板为 **1 主页、2 任务、3 工作流、4 帮助**，按 `1–4` 切页，方向键选中，Enter 进入详情，Esc 返回；帮助页列出插话、验收等按键。鼠标滚轮不操作面板；按住 Shift（macOS 终端通常用 Option）拖选复制。Claude 面板也显示工作流的阶段、工人及最近步骤。
+终端面板为 **1 主页、2 任务、3 工作流、4 帮助**，按 `1–4` 切页，方向键选中，Enter 进入详情，Esc 返回；帮助页列出插话、验收等按键。鼠标滚轮不操作面板；按住 Shift（macOS 终端通常用 Option）拖选复制。Claude 面板也显示工作流的阶段、子代理及最近步骤。
 
-同一 Claude 对话派发的工人可用 `team_list / team_read / team_post` 共享成果和公告板；`scope=all` 可读同机其他任务。跨对话消息需要指定目标；对方提示缓存过期时会拦截发送，改用 `crew peer-log <名字或会话前缀>` 读取上下文。`crew peers` 列出可用对话，`crew msgs` 查看消息记录。
+同一 Claude 对话派发的子代理可用 `team_list / team_read / team_post` 共享成果和公告板；`scope=all` 可读同机其他任务。跨对话消息需要指定目标；对方提示缓存过期时会拦截发送，改用 `crew peer-log <名字或会话前缀>` 读取上下文。`crew peers` 列出可用对话，`crew msgs` 查看消息记录。
 
 ## 配置
 
-状态目录默认为 `~/.crew`，可用 `CREW_HOME` 覆盖。配置在 `config.json`，与内置默认值递归合并；列表由用户值整体替换。修改并发、告警等配置后后台服务自动重读；已启动工人的档案以启动时为准。`CREW_PYTHON` 可覆盖安装时记录的解释器。
+状态目录默认为 `~/.crew`，可用 `CREW_HOME` 覆盖。配置在 `config.json`，与内置默认值递归合并；列表由用户值整体替换。修改并发、告警等配置后后台服务自动重读；已启动子代理的档案以启动时为准。`CREW_PYTHON` 可覆盖安装时记录的解释器。
 
 ```json
 {
@@ -139,13 +149,13 @@ crew restart
 - `codex_bin` / `claude_bin`：命令名或可执行文件路径。Codex 的 MCP 由用户在 Codex 自己的配置中管理，Crew 不读取或改写该配置。
 - `codex_config` / `codex_skill_roots`：可选的 Codex 启动覆盖与额外 skill 目录，默认不设置提供方、代理或额外目录。启用子代理会绕过 Crew 对任务数的统计，默认关闭。
 - `claude`：只有明确使用 `-p claude` / `profile: "claude"` 才启用，使用已登录的 Claude Code 额度。没有额度记录时不阻止派活；有新记录且超过 `quota_stop` 时排队等待重置。
-- `defaults.context_tokens` / `tool_output_chars` / `bash_timeout_s`：chat 工人压缩阈值、工具输出展示长度、单条 shell 默认超时（默认 600 秒，`0` 不限）。Codex 使用自身上下文管理。
-- `worker_env` / `worker_env_note`：给工人的额外环境变量与说明，默认无特定机器依赖。
+- `defaults.context_tokens` / `tool_output_chars` / `bash_timeout_s`：chat 子代理压缩阈值、工具输出展示长度、单条 shell 默认超时（默认 600 秒，`0` 不限）。Codex 使用自身上下文管理。
+- `worker_env` / `worker_env_note`：给子代理的额外环境变量与说明，默认无特定机器依赖。
 - `alert_patterns` / `alert_watch` / `probes`：通用故障扫描、重点关注目标、定时健康命令。`probes` 默认空，可配置 `name / key / cmd / every_s / every_fail_s / timeout_s / match`。
 
 可选的 `gpt-chat` 档案使用 OpenAI 兼容的 Chat Completions API，需要单独的 API 额度，不使用 Codex 订阅。设置该档案的 `model`、`base_url`（默认 `https://api.openai.com/v1`）和 `api_key_env`（默认 `OPENAI_API_KEY`）。key 从环境读取，也可放在 `~/.crew/openai.env`，文件仅含变量赋值，权限建议 `600`；自定义位置用 `env_file`。不要把 key 写进仓库。`crew models gpt-chat` 可查看 API 模型并测试请求。
 
-仅 chat 工人的 MCP 桥读取 Crew 配置中的 `mcp_servers`，默认空；不会寻找未配置的服务。支持 stdio 与 Streamable HTTP：
+仅 chat 子代理的 MCP 桥读取 Crew 配置中的 `mcp_servers`，默认空；不会寻找未配置的服务。支持 stdio 与 Streamable HTTP：
 
 ```json
 {
@@ -210,10 +220,10 @@ crew wf resume <id>
 ## 故障排查
 
 - 看不到 `/crew`：重开会话，检查 CLI 支持 hooks / panel，以及设置中的插件目录；用 `claude --plugin-dir` 临时验证。用 `CREW_BIN` 指定命令可排查查找问题。
-- 工人启动失败：先运行 `codex login status`、`codex app-server --help`，检查 `codex_bin` 和模型权限；看 `crew log <id>`、`~/.crew/daemon.log` 与 `daemon.out`。
+- 子代理启动失败：先运行 `codex login status`、`codex app-server --help`，检查 `codex_bin` 和模型权限；看 `crew log <id>`、`~/.crew/daemon.log` 与 `daemon.out`。
 - 429：保持任务等待，Crew 会退避重试。可降低 `max_parallel`，不需要改用其他档案。
 - 工作流起不来：检查 `node --version` 至少 18，执行 `crew wf check`，看该工作流的 `runner.log`。
-- 告警：`crew alerts`。工人可用 `report_problem`；脚本可输出 `[CREW-ALERT:source-name] 错误说明`。重要目标立即提示，其他故障按重复次数合并。恢复后通过 `alert` 工具或 `crew alerts --resolve <key> --why "原因"` 解除。
+- 告警：`crew alerts`。子代理可用 `report_problem`；脚本可输出 `[CREW-ALERT:source-name] 错误说明`。重要目标立即提示，其他故障按重复次数合并。恢复后通过 `alert` 工具或 `crew alerts --resolve <key> --why "原因"` 解除。
 - 终端中文异常：使用已安装的 UTF-8 locale 和支持 Unicode 的终端；`locale -a` 查看本机候选。Python 需带 curses；macOS 不要求存在 `C.UTF-8`。
 - 停服务：`crew down`；重新 `crew up` 会续跑。派任务与工作流时也会自动启动后台服务。
 
@@ -228,4 +238,4 @@ crew wf resume <id>
 
 卸载保留其他插件和设置，也保留设置备份；手工管理的插件项不会被本安装认领。确认不再需要后可自行删除仓库目录。安装使用自定义 `CREW_HOME` 时，卸载也应传同一个值。
 
-任务、完整提示词、工具输出、提交文件路径、配置和可选 key 位于本机 `~/.crew`（或 CREW_HOME），不应提交到 Git。Codex 和 Claude 自己的登录、MCP、日志由相应 CLI 管理。Crew 不内置遥测；工人调用模型和用户配置的外部工具时，相应请求会发给其服务。工人可以执行本机命令、读写文件；当前后端以非交互模式运行并跳过权限询问，任务说明应明确工作目录和允许修改的范围。
+任务、完整提示词、工具输出、提交文件路径、配置和可选 key 位于本机 `~/.crew`（或 CREW_HOME），不应提交到 Git。Codex 和 Claude 自己的登录、MCP、日志由相应 CLI 管理。Crew 不内置遥测；子代理调用模型和用户配置的外部工具时，相应请求会发给其服务。子代理可以执行本机命令、读写文件；当前后端以非交互模式运行并跳过权限询问，任务说明应明确工作目录和允许修改的范围。
